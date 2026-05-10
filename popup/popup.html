@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=400">
+  <title>StarDownload</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Video Info Section -->
+    <div class="video-info" id="videoInfo">
+      <img id="thumbnail" class="thumbnail" alt="Video thumbnail">
+      <div class="video-details">
+        <h2 id="videoTitle" class="video-title">加载中...</h2>
+      </div>
+    </div>
+
+    <!-- Download Section -->
+    <div class="download-section">
+      <div class="quality-selector">
+        <label for="qualitySelect">画质：</label>
+        <select id="qualitySelect">
+          <option value="best">最高画质</option>
+          <option value="2160p">4K</option>
+          <option value="1440p">1440p</option>
+          <option value="1080p">1080p</option>
+          <option value="720p">720p</option>
+          <option value="480p">480p</option>
+          <option value="audio">仅音频</option>
+        </select>
+      </div>
+
+      <button id="downloadBtn" class="download-btn">
+        <span id="btnText">下载</span>
+      </button>
+    </div>
+
+    <!-- Progress Section -->
+    <div class="progress-section" id="progressSection">
+      <div class="progress-bar-container">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+      <div class="status-text" id="statusText">准备就绪</div>
+    </div>
+
+    <!-- Completion Section -->
+    <div class="completion-section" id="completionSection" style="display: none;">
+      <div class="success-message">
+        <span class="checkmark">&#10003;</span>
+        <span id="successText">下载完成！</span>
+      </div>
+      <div class="file-path" id="filePath"></div>
+      <div class="action-buttons">
+        <button id="playBtn" class="action-btn play-btn">播放视频</button>
+        <button id="openFolderBtn" class="action-btn folder-btn">打开文件夹</button>
+      </div>
+    </div>
+
+    <!-- Error Section -->
+    <div class="error-section" id="errorSection" style="display: none;">
+      <div class="error-message" id="errorMessage"></div>
+      <button id="retryBtn" class="retry-btn">重试</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

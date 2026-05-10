@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(sudo cp /Users/lihailiang/Documents/AI/code/StarDownload/native/stardownload.py /usr/local/bin/stardownload)",
+      "Bash(sudo chmod +x /usr/local/bin/stardownload)",
+      "WebFetch(domain:minimax-algeng-chat-tts.oss-cn-wulanchabu.aliyuncs.com)",
+      "Bash(chmod +x ~/Library/Application Support/StarDownload/stardownload)",
+      "Bash(/opt/homebrew/bin/yt-dlp --list-formats --cookies-from-browser chrome --extractor-args \"youtube:player_client=tv\" \"https://www.youtube.com/watch?v=qzawsRCwvj8\")",
+      "Bash(/opt/homebrew/bin/yt-dlp --list-formats --cookies-from-browser chrome \"https://www.youtube.com/watch?v=qzawsRCwvj8\")",
+      "Bash(/opt/homebrew/bin/yt-dlp:*)",
+      "Bash(brew upgrade:*)",
+      "Bash(/opt/homebrew/bin/python3 -m pip install --upgrade yt-dlp)",
+      "Bash(brew install pipx)",
+      "Bash(pipx install yt-dlp)",
+      "Bash(~/.local/bin/yt-dlp --version)",
+      "Bash(/Users/lihailiang/Library/Python/3.9/bin/yt-dlp --list-formats --cookies-from-browser chrome \"https://www.youtube.com/watch?v=qzawsRCwvj8\")",
+      "Bash(~/Library/Application Support/StarDownload/stardownload)",
+      "Bash(find ~/Downloads -name *.mp4 -mmin -60)",
+      "Bash(ls:*)",
+      "Bash(/Users/lihailiang/Library/Python/3.9/bin/yt-dlp:*)",
+      "Bash(pipx upgrade yt-dlp)",
+      "Bash(~/.local/bin/yt-dlp --cookies-from-browser chrome -o \"~/Downloads/%\\(title\\)s.%\\(ext\\)s\" \"https://www.youtube.com/watch?v=2NiG5hEP24U\")",
+      "Bash(ffmpeg -version)"
+    ]
+  }
+}

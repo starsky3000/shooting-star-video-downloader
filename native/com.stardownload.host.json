@@ -1,0 +1,9 @@
+{
+  "name": "com.stardownload.host",
+  "description": "StarDownload Native Host for YouTube Downloads",
+  "path": "/Users/lihailiang/Library/Application Support/StarDownload/stardownload",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://ckdncmhbljbjfcgbgolmmoelfadjijfn/"
+  ]
+}

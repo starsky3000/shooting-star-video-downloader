@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StarDownload 设置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <h1>StarDownload 设置</h1>
+
+    <form id="optionsForm">
+      <!-- Download Path -->
+      <div class="form-group">
+        <label for="downloadPath">下载保存路径</label>
+        <input type="text" id="downloadPath" placeholder="~/Downloads">
+        <p class="hint">留空则默认为 ~/Downloads</p>
+      </div>
+
+      <!-- Proxy Settings -->
+      <div class="form-group">
+        <label for="proxyAddress">代理服务器地址</label>
+        <input type="text" id="proxyAddress" placeholder="socks5://127.0.0.1:1080">
+        <p class="hint">例如：socks5://127.0.0.1:1080 或 http://127.0.0.1:7890</p>
+      </div>
+
+      <!-- Auto Update -->
+      <div class="form-group">
+        <label class="checkbox-label">
+          <input type="checkbox" id="autoUpdate">
+          <span>自动更新 yt-dlp（每次启动时检查）</span>
+        </label>
+      </div>
+
+      <!-- Save Button -->
+      <div class="form-actions">
+        <button type="submit" class="save-btn">保存设置</button>
+        <button type="button" id="resetBtn" class="reset-btn">重置为默认</button>
+      </div>
+    </form>
+
+    <div class="status-message" id="statusMessage"></div>
+
+    <div class="info-section">
+      <h3>关于</h3>
+      <p>StarDownload v1.0.0</p>
+      <p>使用 yt-dlp 下载 YouTube 视频</p>
+      <p class="small">依赖：yt-dlp, ffmpeg</p>
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
