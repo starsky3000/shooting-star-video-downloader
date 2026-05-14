@@ -23,7 +23,9 @@
       "Bash(~/.local/bin/yt-dlp --cookies-from-browser chrome -o \"~/Downloads/%\\(title\\)s.%\\(ext\\)s\" \"https://www.youtube.com/watch?v=2NiG5hEP24U\")",
       "Bash(ffmpeg -version)",
       "Bash(~/.local/bin/yt-dlp:*)",
-      "mcp__ide__getDiagnostics"
+      "mcp__ide__getDiagnostics",
+      "Bash(open:*)",
+      "Bash(chmod:*)"
     ]
   }
 }

@@ -106,6 +106,33 @@ def needs_update():
     # Simple version comparison
     return current != latest
 
+def get_ffmpeg_path():
+    """Find ffmpeg binary, returns (path, found) tuple"""
+    paths = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ]
+    log(f"get_ffmpeg_path: checking paths={paths}")
+    for p in paths:
+        exists = os.path.isfile(p)
+        executable = exists and os.access(p, os.X_OK)
+        log(f"  check {p}: exists={exists}, executable={executable}")
+        if exists and executable:
+            log(f"  => Found ffmpeg at: {p}")
+            return (p, True)
+    try:
+        result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
+        if result.returncode == 0:
+            path = result.stdout.strip()
+            if os.path.isfile(path):
+                log(f"  => Found ffmpeg via which: {path}")
+                return (path, True)
+    except:
+        pass
+    log("  => ffmpeg NOT FOUND")
+    return ("ffmpeg", False)
+
 def get_default_download_path():
     """Get default download path based on OS"""
     if sys.platform == "darwin":
@@ -292,6 +319,7 @@ def handle_download(request):
         ytdlp,
         "--no-playlist",
         "--progress",
+        "--newline",
         "-o", os.path.join(download_path, "%(title)s.%(ext)s")
     ]
 
@@ -299,29 +327,61 @@ def handle_download(request):
     if proxy:
         cmd.extend(["--proxy", proxy])
 
-    # Format based on quality
+    # Find ffmpeg first to decide strategy
+    ffmpeg, can_merge = get_ffmpeg_path()
+    log(f"ffmpeg detection: path={ffmpeg}, can_merge={can_merge}")
+    if can_merge:
+        cmd.extend(["--ffmpeg-location", ffmpeg])
+        log(f"Added --ffmpeg-location {ffmpeg}")
+    else:
+        log("WARNING: ffmpeg not usable, will NOT merge streams. If video has separate audio/video, it may lose audio.")
+
+    # Format based on quality — always enforce MP4 video stream to avoid
+    # WebM/VP9 in MP4 container which produces unplayable files.
+    format_string = None
     if quality == "audio":
+        format_string = "audio-only"
         cmd.extend(["-x", "--audio-format", "mp3"])
     elif quality == "best":
-        # Merge best video + best audio for highest quality with sound
-        cmd.extend(["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"])
+        if can_merge:
+            format_string = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]"
+            cmd.extend(["-f", format_string, "--merge-output-format", "mp4"])
+        else:
+            format_string = "best[ext=mp4]"
+            cmd.extend(["-f", format_string])
+            log("ffmpeg not found, using pre-muxed format (max 720p)")
     elif quality.isdigit():
-        # Format ID directly (from list-formats) - MUST combine with audio
-        # Use format+bestaudio to ensure we get audio too
-        cmd.extend(["-f", f"{quality}+bestaudio", "--merge-output-format", "mp4"])
+        # Format ID directly from list-formats
+        if can_merge:
+            format_string = f"{quality}+bestaudio[ext=m4a]/best[ext=mp4]"
+            cmd.extend(["-f", format_string, "--merge-output-format", "mp4"])
+        else:
+            format_string = quality
+            cmd.extend(["-f", quality])
+            log("ffmpeg not found, downloading selected format without audio")
     else:
         # Parse quality like "1080p" -> height<=1080
         height = quality.rstrip('p')
         if height.isdigit():
-            cmd.extend(["-f", f"best[height<={height}]+bestaudio/best[height<={height}]", "--merge-output-format", "mp4"])
+            if can_merge:
+                format_string = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]"
+                cmd.extend(["-f", format_string, "--merge-output-format", "mp4"])
+            else:
+                format_string = f"best[height<={height}][ext=mp4]"
+                cmd.extend(["-f", format_string])
+                log("ffmpeg not found, using pre-muxed format")
         else:
-            cmd.extend(["-f", "best", "--merge-output-format", "mp4"])
+            format_string = "best[ext=mp4]"
+            cmd.extend(["-f", format_string])
+
+    log(f"Quality={quality}, format_string={format_string}, can_merge={can_merge}")
 
     cmd.append(url)
 
     send_message({"type": "progress", "percent": 0, "status": "正在解析视频信息..."})
 
     log(f"Command to execute: {' '.join(cmd)}")
+    log(f"Can merge: {can_merge}")
 
     process = None
     try:
@@ -334,52 +394,92 @@ def handle_download(request):
         )
 
         destination_file = None
+        merged_file = None
         last_progress = -1
+        download_phase = 0  # 0=idle, 1=video, 2=audio, 3=post
+
         for line in process.stdout:
             log(f"yt-dlp output: {line.strip()}")
 
-            # Capture destination filename
+            # Capture merged file path from "[Merger] Merging formats into "..."" or "[ffmpeg] ..."
+            merger_match = re.search(r'(?:Merg\w+|ffmpeg)\]\s+.*?"([^"]+)"', line)
+            if merger_match:
+                merged_file = merger_match.group(1)
+                log(f"Captured merged file: {merged_file}")
+                download_phase = 3
+                send_message({"type": "progress", "percent": 97, "status": "正在合并音视频..."})
+
+            # Detect download phase by "Destination:" lines
             if "Destination:" in line:
                 dest_start = line.find("Destination:") + len("Destination: ")
                 destination_file = line[dest_start:].strip()
-                log(f"Captured destination: {destination_file}")
+                log(f"Captured destination ({download_phase}): {destination_file}")
+                if can_merge and not destination_file.endswith('.mp4'):
+                    download_phase += 1
+                elif can_merge and destination_file.endswith('.mp4') and download_phase <= 1:
+                    download_phase = max(download_phase + 1, 1)
 
-            progress = parse_progress(line)
-            if progress is not None:
-                if progress != last_progress or abs(progress - last_progress) > 5:
-                    last_progress = progress
-                    if progress >= 0:
+            # Phase-based progress calculation
+            if "[download]" in line:
+                progress = parse_progress(line)
+                if progress is not None and progress > 0:
+                    if can_merge and download_phase >= 2:
+                        total_progress = 80 + progress * 0.15
+                    elif can_merge and download_phase >= 1:
+                        total_progress = progress * 0.80
+                    else:
+                        total_progress = progress
+
+                    if total_progress != last_progress and abs(total_progress - last_progress) > 0.5:
+                        last_progress = total_progress
                         if not send_message({
                             "type": "progress",
-                            "percent": progress,
-                            "status": f"正在下载中... {progress:.1f}%"
+                            "percent": total_progress,
+                            "status": f"正在下载... {total_progress:.0f}%"
                         }):
-                            # Pipe broken, stop sending progress but keep downloading
                             pass
-                    else:
-                        # Fragment download - throttle these messages
-                        pass
 
-            if "Merging" in line or "Merged" in line:
-                send_message({"type": "progress", "percent": 95, "status": "正在合并音视频..."})
-            elif "Post-processing" in line:
-                send_message({"type": "progress", "percent": 98, "status": "正在处理..."})
+            if "Post-processing" in line or "Embedding" in line:
+                send_message({"type": "progress", "percent": 99, "status": "正在处理..."})
 
         return_code = process.wait()
 
         log(f"yt-dlp return code: {return_code}")
 
         if return_code == 0:
-            # Use captured destination file if available, otherwise find it
-            if destination_file and os.path.exists(destination_file):
+            # List all files in download directory for debugging
+            log(f"=== Download complete, listing files in {download_path} ===")
+            try:
+                all_files = sorted(Path(download_path).iterdir(),
+                                   key=lambda f: os.path.getmtime(f), reverse=True)
+                for f in all_files[:10]:
+                    if f.is_file():
+                        size_mb = f.stat().st_size / (1024 * 1024)
+                        ext = f.suffix
+                        log(f"  {f.name}  ({size_mb:.1f}MB, ext={ext})")
+            except Exception as le:
+                log(f"Error listing directory: {le}")
+            log(f"=== End file listing ===")
+
+            # Prioritize: merged_file > destination_file (if .mp4) > find_downloaded_file
+            file_path = None
+            if merged_file and os.path.exists(merged_file):
+                file_path = merged_file
+                log(f"Using merged file: {file_path}")
+            elif destination_file and os.path.isfile(destination_file) and destination_file.endswith('.mp4'):
                 file_path = destination_file
-                log(f"Using captured destination: {file_path}")
-            else:
+                log(f"Using mp4 destination: {file_path}")
+            elif destination_file and os.path.isfile(destination_file):
+                file_path = destination_file
+                log(f"Using destination (may be audio-only): {file_path}")
+            if not file_path:
                 file_path = find_downloaded_file(download_path, title)
                 log(f"Using find_downloaded_file result: {file_path}")
+            log(f"Final returned file: {file_path}")
             send_message({
                 "type": "complete",
                 "filePath": file_path,
+                "filesize": os.path.getsize(file_path) if os.path.isfile(file_path) else 0,
                 "status": "下载完成！"
             })
         else:
@@ -412,23 +512,21 @@ def handle_download(request):
         send_message({"type": "error", "message": str(e)})
 
 def find_downloaded_file(directory, title):
-    """Find the downloaded file"""
+    """Find the downloaded file - prefer largest recent file (merged result is biggest)"""
     try:
-        files = sorted(Path(directory).iterdir(), key=os.path.getmtime, reverse=True)
+        files = [f for f in Path(directory).iterdir() if f.is_file()]
+        # Sort by mod time descending, then by size descending (merged file is biggest and most recent)
+        files.sort(key=lambda f: (os.path.getmtime(f), f.stat().st_size), reverse=True)
         log(f"Files in {directory}: {[f.name for f in files[:10]]}")
+        # Prefer MP4 with reasonable size (>1MB = definitely has content)
         for f in files:
-            if f.is_file():
-                # Check for merged mp4 first (has audio)
-                if f.suffix == '.mp4' and f.stat().st_size > 1000000:
-                    log(f"Found mp4 file: {f.name} size={f.stat().st_size}")
-                    return str(f)
-        for f in files:
-            if f.is_file() and (title.lower() in f.stem.lower() or f.suffix in ['.mp4', '.mp3', '.mkv', '.webm']):
+            if f.suffix == '.mp4' and f.stat().st_size > 1000000:
+                log(f"Found merged mp4: {f.name} size={f.stat().st_size}")
                 return str(f)
-        if files:
-            for f in files:
-                if f.is_file() and f.suffix in ['.mp4', '.webm', '.mkv']:
-                    return str(f)
+        # Fallback: any video file
+        for f in files:
+            if f.suffix in ['.mp4', '.mkv', '.webm', '.mp3']:
+                return str(f)
     except Exception as e:
         log(f"Error finding file: {e}")
     return directory

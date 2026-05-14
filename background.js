@@ -2,24 +2,26 @@
 
 // Download state management
 let downloadState = {
-  status: 'idle', // idle, checking, updating, downloading, complete, error
+  status: 'idle', // idle, downloading, paused, complete, error
   progress: 0,
   statusText: '',
   filePath: '',
   errorMessage: '',
-  videoId: null // Track current video ID for state restoration
+  videoId: null
 };
 
 // Downloaded videos list (persisted)
 let downloadedVideos = [];
 
-// Current yt-dlp version
-const REQUIRED_YTDLP_VERSION = null; // No longer used, we check against actual latest
+// Native port for download
+let downloadPort = null;
+let downloadComplete = false;
+let pausedProgress = 0;
+let lastDownloadRequest = null;
 
 // Update download state
 function updateDownloadState(state) {
   downloadState = { ...downloadState, ...state };
-  // Persist state
   chrome.storage.local.set({ downloadState });
 }
 
@@ -29,33 +31,34 @@ function updateDownloadedVideos(videos) {
   chrome.storage.local.set({ downloadedVideos });
 }
 
-// Update extension icon based on whether we're on a YouTube video page
+// Update extension icon based on whether we're on a YouTube video page with valid video info
 function updateIcon(isYouTubeVideo, hasVideoInfo) {
   if (isYouTubeVideo && hasVideoInfo) {
-    // Video page with info - enable icon (normal)
     chrome.action.setIcon({ path: {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }});
-  } else if (isYouTubeVideo && !hasVideoInfo) {
-    // YouTube but not a video page or waiting for info - use disabled icon
-    chrome.action.setIcon({ path: {
-      "16": "icons/icon-disabled-16.png",
-      "32": "icons/icon-disabled-32.png",
-      "48": "icons/icon-disabled-48.png",
-      "128": "icons/icon128.png"  // Use normal for 128 as we don't have disabled version
-    }});
   } else {
-    // Not on YouTube video page - use disabled icon
     chrome.action.setIcon({ path: {
       "16": "icons/icon-disabled-16.png",
       "32": "icons/icon-disabled-32.png",
       "48": "icons/icon-disabled-48.png",
-      "128": "icons/icon128.png"
+      "128": "icons/icon-disabled-48.png"
     }});
   }
+}
+
+// Initialize all tabs with gray icon
+function initAllTabsGray() {
+  updateIcon(false, false);
+  chrome.tabs.query({}, (tabs) => {
+    const youtubeTabs = tabs.filter(t => t.url && t.url.includes('youtube.com/watch'));
+    youtubeTabs.forEach(tab => {
+      checkYouTubeVideoStatus(tab.id, tab.url);
+    });
+  });
 }
 
 // Listen for tab updates to check YouTube video status
@@ -74,79 +77,189 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   });
 });
 
-// Track current tab's video status
-let currentTabVideoReady = false;
-let currentTabIsYouTubeWatch = false;
-
 // Check if URL is a YouTube watch page with video
 function checkYouTubeVideoStatus(tabId, url) {
-  if (!url || !url.includes('youtube.com')) {
-    currentTabIsYouTubeWatch = false;
-    currentTabVideoReady = false;
+  if (!url || !url.includes('youtube.com/watch')) {
     updateIcon(false, false);
     return;
   }
 
-  // Check if it's a watch page (video page)
-  if (url.includes('/watch')) {
-    currentTabIsYouTubeWatch = true;
-    // It's a watch page - disable icon initially (waiting for info)
-    updateIcon(true, false);
+  updateIcon(true, false);
 
-    // Try to get video info from the page to confirm it's a video
-    try {
-      chrome.tabs.sendMessage(tabId, { action: 'ping' }, (response) => {
-        if (chrome.runtime.lastError) {
-          // Content script not loaded yet, that's fine
-          return;
-        }
-        if (response && response.hasVideo) {
-          currentTabVideoReady = true;
-          updateIcon(true, true);
-        }
-      });
-    } catch (e) {
-      // Tab might not be ready
-    }
+  try {
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const videoId = new URL(location.href).searchParams.get('v');
+        const videoEl = document.querySelector('video');
+        return !!(videoId && videoEl && videoEl.duration);
+      },
+      world: 'MAIN'
+    }).then((results) => {
+      if (results && results[0] && results[0].result) {
+        updateIcon(true, true);
+      }
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+// === Download Management (Native Port in Background) ===
+
+function doStartDownload(request) {
+  log('doStartDownload called');
+  downloadComplete = false;
+
+  lastDownloadRequest = {
+    action: 'download',
+    url: request.url,
+    title: request.title,
+    quality: request.quality
+  };
+
+  if (request.isResume) {
+    log(`Resuming download, pausedProgress=${pausedProgress}`);
   } else {
-    // Not a watch page (homepage, search, channel, etc.)
-    currentTabIsYouTubeWatch = false;
-    currentTabVideoReady = false;
-    updateIcon(false, false);
+    pausedProgress = 0;
+  }
+
+  try {
+    downloadPort = chrome.runtime.connectNative('com.stardownload.host');
+    log('Native port connected for download');
+
+    downloadPort.onMessage.addListener((response) => {
+      log(`Native message: ${JSON.stringify(response)}`);
+      handleDownloadMessage(response);
+    });
+
+    downloadPort.onDisconnect.addListener(() => {
+      log('Native port disconnected');
+      downloadPort = null;
+      if (!downloadComplete && downloadState.status === 'downloading') {
+        updateDownloadState({
+          status: 'error',
+          errorMessage: '连接中断，请重试'
+        });
+      }
+    });
+
+    downloadPort.postMessage(lastDownloadRequest);
+    log('Download request sent');
+
+    updateDownloadState({
+      status: 'downloading',
+      progress: pausedProgress,
+      statusText: pausedProgress > 0 ? '继续下载...' : '正在解析视频信息...',
+      videoId: request.videoId || null,
+      videoTitle: request.title || null,
+      qualityMeta: request.qualityMeta || null,
+      quality: request.quality || null
+    });
+
+  } catch (err) {
+    log(`doStartDownload error: ${err.message}`);
+    updateDownloadState({
+      status: 'error',
+      errorMessage: '无法启动下载：' + err.message
+    });
   }
 }
 
-// Handle messages from content script
+function handleDownloadMessage(message) {
+  switch (message.type) {
+    case 'progress':
+      if (pausedProgress > 0) {
+        const adjusted = pausedProgress + (message.percent * (100 - pausedProgress) / 100);
+        updateDownloadState({
+          status: 'downloading',
+          progress: adjusted,
+          statusText: message.status
+        });
+      } else {
+        updateDownloadState({
+          status: 'downloading',
+          progress: message.percent,
+          statusText: message.status
+        });
+      }
+      break;
+
+    case 'complete':
+      downloadComplete = true;
+      pausedProgress = 0;
+      downloadPort = null;
+      // Preserve qualityMeta/quality/videoTitle from the start state
+      updateDownloadState({
+        status: 'complete',
+        progress: 100,
+        statusText: '下载完成！',
+        filePath: message.filePath,
+        filesize: message.filesize || 0
+      });
+      break;
+
+    case 'error':
+      downloadComplete = true;
+      pausedProgress = 0;
+      downloadPort = null;
+      updateDownloadState({
+        status: 'error',
+        errorMessage: message.message
+      });
+      break;
+  }
+}
+
+function doPauseDownload() {
+  log('doPauseDownload called');
+  pausedProgress = downloadState.progress;
+  if (downloadPort) {
+    downloadPort.disconnect();
+    downloadPort = null;
+  }
+  updateDownloadState({
+    status: 'paused',
+    progress: pausedProgress,
+    statusText: '下载已暂停'
+  });
+}
+
+function doCancelDownload() {
+  log('doCancelDownload called');
+  downloadComplete = true;
+  pausedProgress = 0;
+  if (downloadPort) {
+    downloadPort.disconnect();
+    downloadPort = null;
+  }
+  updateDownloadState({
+    status: 'idle',
+    progress: 0,
+    statusText: '',
+    filePath: '',
+    errorMessage: '',
+    videoId: null
+  });
+}
+
+function log(msg) {
+  console.log(`[StarDownload BG] ${msg}`);
+}
+
+// Handle messages from popup and content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'videoInfoReceived') {
-    // Content script detected video info on the page
     updateIcon(true, true);
     sendResponse({ success: true });
-  } else if (request.type === 'downloadProgress') {
-    updateDownloadState({
-      status: 'downloading',
-      progress: request.percent,
-      statusText: request.status,
-      videoId: request.videoId || downloadState.videoId
-    });
-  } else if (request.type === 'downloadComplete') {
-    updateDownloadState({
-      status: 'complete',
-      progress: 100,
-      statusText: '下载完成！',
-      filePath: request.filePath,
-      videoId: request.videoId || downloadState.videoId
-    });
-    // Download done, enable icon
-    chrome.action.enable();
-  } else if (request.type === 'downloadError') {
-    updateDownloadState({
-      status: 'error',
-      errorMessage: request.message,
-      videoId: request.videoId || downloadState.videoId
-    });
+  } else if (request.type === 'startDownload') {
+    doStartDownload(request);
+    sendResponse({ success: true });
+  } else if (request.type === 'pauseDownload') {
+    doPauseDownload();
+    sendResponse({ success: true });
+  } else if (request.type === 'cancelDownload') {
+    doCancelDownload();
+    sendResponse({ success: true });
   } else if (request.type === 'getDownloadState') {
-    // Return current state to popup
     sendResponse(downloadState);
     return true;
   } else if (request.type === 'getDownloadedVideos') {
@@ -157,7 +270,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
     return true;
   } else if (request.type === 'checkVersion') {
-    // Popup asking for version status
     checkYtDlpVersion().then(info => {
       sendResponse({
         currentVersion: info.version,
@@ -176,12 +288,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   return true;
 });
 
-// Handle extension icon click (popup mode - no action needed since popup handles it)
+// Handle extension icon click
 chrome.action.onClicked.addListener((tab) => {
-  // Popup mode - do nothing, browser handles popup automatically
+  // Popup mode - browser handles popup automatically
 });
 
-// Handle installation - do NOT set global side panel options
+// Handle installation
 chrome.runtime.onInstalled.addListener((details) => {
   console.log('StarDownload: Extension installed/updated');
 });
@@ -190,11 +302,30 @@ chrome.runtime.onInstalled.addListener((details) => {
 chrome.storage.local.get(['downloadState', 'downloadedVideos'], (result) => {
   if (result.downloadState) {
     downloadState = result.downloadState;
+    pausedProgress = downloadState.progress || 0;
   }
   if (result.downloadedVideos) {
     downloadedVideos = result.downloadedVideos;
   }
+  // If service worker was killed during download, reset to idle (port is gone)
+  if (downloadState.status === 'downloading') {
+    log('Service worker restarted with active download state - resetting');
+    updateDownloadState({
+      status: 'error',
+      errorMessage: '浏览器已重启，请重新下载'
+    });
+  }
+  if (downloadState.status === 'paused') {
+    log('Service worker restarted with paused state - resetting');
+    updateDownloadState({
+      status: 'error',
+      errorMessage: '浏览器已重启，请重新下载'
+    });
+  }
 });
+
+// Set all icons to gray immediately, then check YouTube tabs
+initAllTabsGray();
 
 // Check yt-dlp version by querying native host
 function checkYtDlpVersion() {
@@ -220,10 +351,8 @@ function checkYtDlpVersion() {
         resolve({ version: null, latestVersion: null, needsUpdate: true });
       });
 
-      // Send version check request
       port.postMessage({ action: 'getVersion' });
 
-      // Timeout after 10 seconds (longer for network requests)
       timeoutId = setTimeout(() => {
         port.disconnect();
         resolve({ version: null, latestVersion: null, needsUpdate: true });

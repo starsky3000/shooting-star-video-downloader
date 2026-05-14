@@ -1,12 +1,12 @@
 // StarDownload Popup Script
 
 let currentVideoInfo = null;
-let downloadComplete = false;
 let currentVideoId = null;
 let downloadedVideos = [];
-let downloadPort = null;
+let downloadComplete = false;
 let downloadPaused = false;
 let lastDownloadRequest = null;
+let storageChangeListener = null;
 
 // Cache storage reference
 let storageLocal = null;
@@ -64,9 +64,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   retryBtn.addEventListener('click', resetState);
   setupEventListeners();
 
+  // Clean up storage listener when popup closes
+  window.addEventListener('beforeunload', () => {
+    if (storageChangeListener) {
+      chrome.storage.onChanged.removeListener(storageChangeListener);
+      storageChangeListener = null;
+    }
+  });
+
   // Load downloaded videos directly from storage
   loadDownloadedVideos();
   renderDownloadedList();
+
+  // Hide progress bar initially (shown only when downloading)
+  progressSection.style.display = 'none';
 
   // Load cached video info and formats for fast display
   await loadCachedVideoInfo();
@@ -77,6 +88,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (!nativeOk) {
     log('Native host not available, showing setup UI');
     showSetupUI();
+    return;
+  }
+
+  // Restore download state if there's an active/paused/completed download
+  const restored = await restoreDownloadState();
+  if (restored) {
+    log('Restored download state, skipping normal setup');
     return;
   }
 
@@ -94,12 +112,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   const currentVideoIdFromUrl = new URL(tab.url).searchParams.get('v');
   log(`Current video ID from URL: ${currentVideoIdFromUrl}`);
 
-  // Check if we have cached info for this video
+  // Check if we have cached info for this video — show directly, no loading flash
   if (cachedVideoInfo && cachedVideoInfo.videoId === currentVideoIdFromUrl) {
     log('Using cached video info for fast display');
     currentVideoInfo = cachedVideoInfo;
     currentVideoId = currentVideoIdFromUrl;
     displayVideoInfo(currentVideoInfo);
+    // Directly show video, no loading state
     showLoadingState(false);
     currentVideo.style.display = 'block';
     // Notify background that video info is ready (for icon)
@@ -361,7 +380,10 @@ function addDownloadedVideo(videoInfo) {
     title: videoInfo.title,
     filePath: videoInfo.filePath,
     thumbnail: videoInfo.thumbnail,
-    downloadedAt: Date.now()
+    downloadedAt: Date.now(),
+    quality: videoInfo.quality || '',
+    filesize: videoInfo.filesize || 0,
+    qualityMeta: videoInfo.qualityMeta || null
   });
 
   // Keep only last 20
@@ -393,27 +415,73 @@ function renderDownloadedList() {
   }
 
   downloadedTitle.style.display = 'block';
-  downloadedList.innerHTML = downloadedVideos.map(video => `
-    <div class="downloaded-item" data-video-id="${video.videoId}">
-      <img class="thumbnail" src="${video.thumbnail}" alt="thumbnail">
+  downloadedList.innerHTML = downloadedVideos.map(video => {
+    const meta = video.qualityMeta;
+    const resolution = meta?.height ? (meta.height === 2160 ? '4K' : meta.height + 'p') :
+                       qualityToLabel(video.quality);
+    const ext = meta?.ext || (video.filePath ? video.filePath.split('.').pop().toUpperCase() : '');
+    const sizeStr = formatSize(video.filesize);
+    const metaParts = [resolution, ext, sizeStr].filter(Boolean);
+    const metaText = metaParts.join(' · ');
+    return `
+    <div class="downloaded-item" data-video-id="${escapeAttr(video.videoId)}" data-path="${escapeAttr(video.filePath)}">
+      <img class="thumbnail" src="${escapeAttr(video.thumbnail)}" alt="thumbnail">
       <div class="info">
-        <div class="title">${video.title}</div>
-        <div class="meta">${video.filePath ? video.filePath.split('/').pop() : ''}</div>
+        <div class="title">${escapeHtml(video.title)}</div>
+        <div class="meta">${metaText || (video.filePath ? video.filePath.split('/').pop() : '')}</div>
       </div>
       <div class="actions">
         <button class="mini-btn play" data-path="${escapeAttr(video.filePath)}">播放</button>
         <button class="mini-btn folder" data-path="${escapeAttr(video.filePath)}">文件夹</button>
       </div>
     </div>
-  `).join('');
+  `;}).join('');
 
-  // Add event listeners
+  // Add event listeners — mini buttons
   downloadedList.querySelectorAll('.mini-btn.play').forEach(btn => {
-    btn.addEventListener('click', () => playDownloaded(btn.dataset.path));
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      playDownloaded(btn.dataset.path);
+    });
   });
   downloadedList.querySelectorAll('.mini-btn.folder').forEach(btn => {
-    btn.addEventListener('click', () => openDownloadedFolder(btn.dataset.path));
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openDownloadedFolder(btn.dataset.path);
+    });
   });
+
+  // Add event listeners — click thumbnail or title to play
+  downloadedList.querySelectorAll('.downloaded-item .thumbnail').forEach(img => {
+    img.addEventListener('click', () => {
+      const item = img.closest('.downloaded-item');
+      if (item) playDownloaded(item.dataset.path);
+    });
+  });
+  downloadedList.querySelectorAll('.downloaded-item .title').forEach(title => {
+    title.addEventListener('click', () => {
+      const item = title.closest('.downloaded-item');
+      if (item) playDownloaded(item.dataset.path);
+    });
+  });
+}
+
+// Convert quality value to human-readable label
+function qualityToLabel(quality) {
+  if (!quality) return '';
+  if (quality === 'best') return '最高';
+  if (quality === 'audio') return '音频';
+  if (quality === '2160p') return '4K';
+  // Strip 'p' suffix
+  const num = parseInt(quality);
+  if (num > 0) return quality;
+  return quality.replace(/p$/i, 'P');
+}
+
+// Escape HTML entities
+function escapeHtml(str) {
+  if (!str) return '';
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // Escape attribute for HTML
@@ -552,11 +620,14 @@ function populateQualitySelect(formats) {
     }
   }
 
+  // Helper: convert height to display label (e.g. 2160 → 4K)
+  const heightLabel = (h) => h === 2160 ? '4K' : `${h}p`;
+
   // Add video formats (exclude mhtml which is not a real video format)
   if (hasVideo) {
     if (bestMp4) {
       const sizeStr = formatSize(bestMp4.filesize);
-      const label = sizeStr ? `${bestMp4.height}p MP4 ${sizeStr} (推荐)` : `${bestMp4.height}p MP4 (推荐)`;
+      const label = sizeStr ? `${heightLabel(bestMp4.height)} MP4 ${sizeStr} (最高画质)` : `${heightLabel(bestMp4.height)} MP4 (最高画质)`;
       addQualityOption(bestMp4.id, label, true);
     }
 
@@ -568,8 +639,8 @@ function populateQualitySelect(formats) {
       if (fmt.height && fmt.ext !== 'mhtml' && !addedHeights.has(fmt.height)) {
         const sizeStr = formatSize(fmt.filesize);
         const label = fmt.ext === 'mp4'
-          ? (sizeStr ? `${fmt.height}p MP4 ${sizeStr}` : `${fmt.height}p MP4`)
-          : `${fmt.height}p ${fmt.ext.toUpperCase()}${sizeStr ? ' ' + sizeStr : ''}`;
+          ? (sizeStr ? `${heightLabel(fmt.height)} MP4 ${sizeStr}` : `${heightLabel(fmt.height)} MP4`)
+          : `${heightLabel(fmt.height)} ${fmt.ext.toUpperCase()}${sizeStr ? ' ' + sizeStr : ''}`;
         addQualityOption(fmt.id, label);
         addedHeights.add(fmt.height);
       }
@@ -696,7 +767,7 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
   }
 }
 
-// Start download process
+// Start download process (delegates to background service worker)
 function startDownload() {
   log('startDownload called');
   if (!currentVideoInfo) {
@@ -710,64 +781,59 @@ function startDownload() {
 
   const quality = qualitySelect.value;
   log(`Quality selected: ${quality}`);
-  lastDownloadRequest = {
-    action: 'download',
+
+  // Capture format metadata (resolution, ext) for downloaded list display
+  let qualityMeta = null;
+  if (cachedFormats) {
+    const fmt = cachedFormats.find(f => f.id === quality);
+    if (fmt) {
+      qualityMeta = {
+        height: fmt.height,
+        ext: fmt.ext?.toUpperCase() || '',
+        filesize: fmt.filesize
+      };
+    }
+  }
+
+  lastDownloadRequest = { qualityMeta };
+
+  // Send download command to background (which manages the native port)
+  chrome.runtime.sendMessage({
+    type: 'startDownload',
     url: currentVideoInfo.url,
     title: currentVideoInfo.title,
-    quality: quality
-  };
-  log(`Download request: ${JSON.stringify(lastDownloadRequest)}`);
+    quality: quality,
+    videoId: currentVideoId,
+    qualityMeta: qualityMeta
+  }).catch(() => {});
 
-  try {
-    log('Connecting to native host');
-    downloadPort = chrome.runtime.connectNative('com.stardownload.host');
-    log('Native port connected');
-
-    downloadPort.onMessage.addListener((response) => {
-      log(`Native message: ${JSON.stringify(response)}`);
-      handleNativeMessage(response);
-    });
-
-    downloadPort.onDisconnect.addListener(() => {
-      log('Native port disconnected');
-      downloadPort = null;
-      if (!downloadComplete) {
-        showError('连接中断，请重试');
-        showDownloadBtn();
-      }
-    });
-
-    log('Sending download request');
-    downloadPort.postMessage(lastDownloadRequest);
-    log('Download request sent');
-
-    setDownloadingState();
-
-  } catch (err) {
-    log(`startDownload error: ${err.message}`);
-    showError('无法启动下载：' + err.message);
-    showDownloadBtn();
-  }
+  setDownloadingState();
+  watchDownloadState();
 }
 
 // Toggle pause/resume download
 function togglePauseDownload() {
   if (downloadPaused) {
-    // Resume: restart download
+    // Resume
     downloadPaused = false;
     pauseBtnText.textContent = '暂停';
     pauseBtn.className = 'download-action-btn pause-btn';
-    startDownload();
+    chrome.runtime.sendMessage({
+      type: 'startDownload',
+      url: currentVideoInfo.url,
+      title: currentVideoInfo.title,
+      quality: qualitySelect.value,
+      videoId: currentVideoId,
+      qualityMeta: lastDownloadRequest?.qualityMeta || null,
+      isResume: true
+    }).catch(() => {});
+    watchDownloadState();
   } else {
-    // Pause: kill the current download
+    // Pause: tell background to pause
     downloadPaused = true;
     pauseBtnText.textContent = '继续';
     pauseBtn.className = 'download-action-btn resume-btn';
-    statusText.textContent = '下载已暂停';
-    if (downloadPort) {
-      downloadPort.disconnect();
-      downloadPort = null;
-    }
+    chrome.runtime.sendMessage({ type: 'pauseDownload' }).catch(() => {});
   }
 }
 
@@ -776,9 +842,10 @@ function cancelDownload() {
   log('cancelDownload called');
   downloadPaused = false;
   downloadComplete = false;
-  if (downloadPort) {
-    downloadPort.disconnect();
-    downloadPort = null;
+  chrome.runtime.sendMessage({ type: 'cancelDownload' }).catch(() => {});
+  if (storageChangeListener) {
+    chrome.storage.onChanged.removeListener(storageChangeListener);
+    storageChangeListener = null;
   }
   resetState();
 }
@@ -797,60 +864,175 @@ function showDownloadActions() {
   pauseBtn.className = 'download-action-btn pause-btn';
 }
 
-// Handle messages from native host
-function handleNativeMessage(message) {
-  switch (message.type) {
-    case 'progress':
-      updateProgress(message.percent, message.status);
-      // Fire and forget - don't wait for background script response
-      setTimeout(() => {
-        chrome.runtime.sendMessage({
-          type: 'downloadProgress',
-          percent: message.percent,
-          status: message.status,
-          videoId: currentVideoId
-        }).catch(() => {});
-      }, 0);
-      break;
-    case 'complete':
-      downloadComplete = true;
-      downloadPort = null;
-      showDownloadBtn();
-      showCompletion(message.filePath);
-      // Add to downloaded list
-      addDownloadedVideo({
-        videoId: currentVideoId,
-        title: currentVideoInfo.title,
-        filePath: message.filePath,
-        thumbnail: currentVideoInfo.thumbnail
-      });
-      setTimeout(() => {
-        chrome.runtime.sendMessage({
-          type: 'downloadComplete',
-          filePath: message.filePath,
-          videoId: currentVideoId
-        }).catch(() => {});
-      }, 0);
-      break;
-    case 'error':
-      downloadComplete = true;
-      downloadPort = null;
-      showDownloadBtn();
-      showError(message.message);
-      if (message.message && message.message.includes('format is not available')) {
-        setDownloadingState();
-        statusText.textContent = '正在检查 yt-dlp 版本...';
-        tryUpdateYtDlp();
-      }
-      setTimeout(() => {
-        chrome.runtime.sendMessage({
-          type: 'downloadError',
-          message: message.message,
-          videoId: currentVideoId
-        }).catch(() => {});
-      }, 0);
-      break;
+// Watch downloadState changes in storage (for real-time progress)
+function watchDownloadState() {
+  if (storageChangeListener) {
+    chrome.storage.onChanged.removeListener(storageChangeListener);
   }
+  storageChangeListener = (changes, namespace) => {
+    if (namespace !== 'local' || !changes.downloadState) return;
+    const state = changes.downloadState.newValue;
+    if (!state) return;
+    log(`Storage change: status=${state.status}, progress=${state.progress}`);
+
+    switch (state.status) {
+      case 'downloading':
+        if (!downloadPaused) {
+          updateProgress(state.progress, state.statusText);
+          showDownloadActions();
+          progressSection.style.display = 'block';
+        }
+        break;
+      case 'paused':
+        updateProgress(state.progress, '下载已暂停');
+        showDownloadActions();
+        progressSection.style.display = 'block';
+        break;
+      case 'complete':
+        downloadComplete = true;
+        if (storageChangeListener) {
+          chrome.storage.onChanged.removeListener(storageChangeListener);
+          storageChangeListener = null;
+        }
+        showDownloadBtn();
+        showCompletion(state.filePath);
+        // Add to downloaded list
+        addDownloadedVideo({
+          videoId: currentVideoId,
+          title: currentVideoInfo?.title || cachedVideoInfo?.title || '',
+          filePath: state.filePath,
+          thumbnail: currentVideoInfo?.thumbnail || cachedVideoInfo?.thumbnail || '',
+          quality: qualitySelect.value,
+          filesize: state.filesize || 0,
+          qualityMeta: lastDownloadRequest?.qualityMeta || null
+        });
+        break;
+      case 'error':
+        downloadComplete = true;
+        if (storageChangeListener) {
+          chrome.storage.onChanged.removeListener(storageChangeListener);
+          storageChangeListener = null;
+        }
+        showDownloadBtn();
+        showError(state.errorMessage);
+        break;
+      case 'idle':
+        if (storageChangeListener) {
+          chrome.storage.onChanged.removeListener(storageChangeListener);
+          storageChangeListener = null;
+        }
+        break;
+    }
+  };
+  chrome.storage.onChanged.addListener(storageChangeListener);
+}
+
+// Restore download state when popup opens (e.g., download was started and popup was closed)
+async function restoreDownloadState() {
+  return new Promise((resolve) => {
+    if (!storageLocal) {
+      resolve(false);
+      return;
+    }
+    storageLocal.get(['downloadState'], (result) => {
+      const state = result.downloadState;
+      if (!state || state.status === 'idle') {
+        resolve(false);
+        return;
+      }
+
+      log(`Restoring download state: status=${state.status}, progress=${state.progress}`);
+
+      // Reconstruct video info from cache
+      if (cachedVideoInfo && state.videoId && cachedVideoInfo.videoId === state.videoId) {
+        currentVideoInfo = cachedVideoInfo;
+        currentVideoId = cachedVideoInfo.videoId;
+      } else {
+        currentVideoId = state.videoId;
+        currentVideoInfo = {
+          videoId: state.videoId,
+          title: state.videoTitle || '视频',
+          url: state.videoId ? `https://www.youtube.com/watch?v=${state.videoId}` : '',
+          thumbnail: state.videoId ? `https://i.ytimg.com/vi/${state.videoId}/mqdefault.jpg` : ''
+        };
+      }
+
+      showLoadingState(false);
+      currentVideo.style.display = 'block';
+
+      switch (state.status) {
+        case 'downloading':
+          displayVideoInfo(currentVideoInfo);
+          showDownloadActions();
+          downloadPaused = false;
+          progressSection.style.display = 'block';
+          updateProgress(state.progress, state.statusText || '下载中...');
+          downloadBtn.style.display = 'none';
+          watchDownloadState();
+          // Also fetch formats in background for when download completes
+          if (currentVideoInfo.url) {
+            fetchFormats(currentVideoInfo.url);
+          }
+          break;
+
+        case 'paused':
+          displayVideoInfo(currentVideoInfo);
+          showDownloadActions();
+          downloadPaused = true;
+          progressSection.style.display = 'block';
+          updateProgress(state.progress, '下载已暂停');
+          pauseBtnText.textContent = '继续';
+          pauseBtn.className = 'download-action-btn resume-btn';
+          downloadBtn.style.display = 'none';
+          watchDownloadState();
+          if (currentVideoInfo.url) {
+            fetchFormats(currentVideoInfo.url);
+          }
+          break;
+
+        case 'complete':
+          // Show the completed state and add to downloaded list
+          downloadComplete = true;
+          showDownloadBtn();
+          progressSection.style.display = 'none';
+          if (state.filePath) {
+            showCompletion(state.filePath);
+            // Add to downloaded list
+            addDownloadedVideo({
+              videoId: currentVideoId,
+              title: currentVideoInfo?.title || state.videoTitle || '',
+              filePath: state.filePath,
+              thumbnail: currentVideoInfo?.thumbnail || '',
+              quality: state.quality || '',
+              filesize: state.filesize || 0,
+              qualityMeta: state.qualityMeta || null
+            });
+            // Reset state to idle so next open doesn't show completion again
+            chrome.runtime.sendMessage({ type: 'cancelDownload' }).catch(() => {});
+          }
+          break;
+
+        case 'error':
+          showError(state.errorMessage || '下载出错');
+          chrome.runtime.sendMessage({ type: 'cancelDownload' }).catch(() => {});
+          break;
+
+        default:
+          resolve(false);
+          return;
+      }
+
+      // Clean up listener on popup close
+      window.addEventListener('beforeunload', () => {
+        if (storageChangeListener) {
+          chrome.storage.onChanged.removeListener(storageChangeListener);
+          storageChangeListener = null;
+        }
+      });
+
+      resolve(true);
+    });
+  });
 }
 
 // Try to update yt-dlp after download failure
@@ -916,6 +1098,8 @@ function showNonVideoError(message) {
   videoTitle.textContent = message;
   videoTitle.style.color = '#888888';
   videoTitle.style.fontSize = '14px';
+  videoTitle.style.textAlign = 'center';
+  videoTitle.style.webkitLineClamp = 'unset';
   thumbnail.style.display = 'none';
   durationBadge.style.display = 'none';
   qualitySelect.parentElement.style.display = 'none';

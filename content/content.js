@@ -1,5 +1,27 @@
 // StarDownload Content Script - Runs on YouTube pages
 
+// Proactively report video availability to background for icon update
+function reportVideoStatus() {
+  const isVideoPage = window.location.href.includes('/watch?v=');
+  const hasVideoEl = document.querySelector('video');
+  if (isVideoPage && hasVideoEl && hasVideoEl.duration) {
+    chrome.runtime.sendMessage({ type: 'videoInfoReceived' }).catch(() => {});
+  }
+}
+
+// Report immediately on load
+reportVideoStatus();
+
+// Also report after YouTube SPA navigations (e.g., clicking another video)
+let lastUrl = window.location.href;
+new MutationObserver(() => {
+  const currentUrl = window.location.href;
+  if (currentUrl !== lastUrl) {
+    lastUrl = currentUrl;
+    setTimeout(reportVideoStatus, 2000);
+  }
+}).observe(document.querySelector('title') || document.body, { subtree: true, childList: true });
+
 // Listen for messages from popup or background
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getVideoInfo') {
