@@ -21,7 +21,9 @@
       "Bash(/Users/lihailiang/Library/Python/3.9/bin/yt-dlp:*)",
       "Bash(pipx upgrade yt-dlp)",
       "Bash(~/.local/bin/yt-dlp --cookies-from-browser chrome -o \"~/Downloads/%\\(title\\)s.%\\(ext\\)s\" \"https://www.youtube.com/watch?v=2NiG5hEP24U\")",
-      "Bash(ffmpeg -version)"
+      "Bash(ffmpeg -version)",
+      "Bash(~/.local/bin/yt-dlp:*)",
+      "mcp__ide__getDiagnostics"
     ]
   }
 }

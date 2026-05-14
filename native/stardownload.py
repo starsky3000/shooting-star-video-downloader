@@ -165,16 +165,108 @@ def parse_progress(line):
     return None
 
 def send_message(msg):
-    """Send JSON message to stdout using Native Messaging protocol"""
-    import struct
-    log(f"Sending message: {msg}")
-    message = json.dumps(msg)
-    # Encode as UTF-8 (Chrome expects UTF-8 on macOS)
-    encoded = message.encode('utf-8')
-    # Write 4-byte little-endian length prefix
-    length = struct.pack('<I', len(encoded))
-    sys.stdout.buffer.write(length + encoded)
-    sys.stdout.buffer.flush()
+    """Send JSON message to stdout using Native Messaging protocol.
+    Returns True if sent successfully, False if the pipe is broken."""
+    try:
+        log(f"Sending message: {msg}")
+        message = json.dumps(msg)
+        # Encode as UTF-8 (Chrome expects UTF-8 on macOS)
+        encoded = message.encode('utf-8')
+        # Write 4-byte little-endian length prefix
+        length = struct.pack('<I', len(encoded))
+        sys.stdout.buffer.write(length + encoded)
+        sys.stdout.buffer.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        log("send_message: Broken pipe (Chrome disconnected)")
+        return False
+
+
+def handle_list_formats(request):
+    """List available formats for a video using yt-dlp JSON output"""
+    url = request.get("url")
+    if not url:
+        send_message({"type": "error", "message": "No URL provided"})
+        return
+
+    ytdlp = get_ytdlp_path()
+    # Use -j to get JSON output instead of parsing table format
+    cmd = [ytdlp, "--no-playlist", "-j", "--no-download", url]
+
+    log(f"Command to execute: {' '.join(cmd)}")
+
+    try:
+        process = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20
+        )
+        output = process.stdout
+        log(f"JSON output length: {len(output)}")
+
+        # Parse formats from JSON
+        formats = parse_formats_from_json(output)
+        log(f"Parsed {len(formats)} formats")
+
+        send_message({
+            "type": "formats",
+            "formats": formats
+        })
+    except subprocess.TimeoutExpired:
+        log("Format listing timed out")
+        send_message({"type": "error", "message": "获取格式超时"})
+    except json.JSONDecodeError as e:
+        log(f"JSON parse error: {e}")
+        # Fallback: try table-based parsing
+        send_message({"type": "error", "message": f"解析格式信息失败: {e}"})
+    except Exception as e:
+        log(f"handle_list_formats error: {e}")
+        send_message({"type": "error", "message": str(e)})
+
+
+def parse_formats_from_json(output):
+    """Parse format list from yt-dlp JSON output"""
+    data = json.loads(output)
+    formats = []
+
+    raw_formats = data.get("formats", [])
+    if not raw_formats:
+        return formats
+
+    for fmt in raw_formats:
+        format_id = fmt.get("format_id", "")
+        ext = fmt.get("ext", "")
+        height = fmt.get("height")
+        filesize = fmt.get("filesize")
+
+        # Check if this is a video format (has resolution)
+        has_video = fmt.get("vcodec") and fmt.get("vcodec") != "none"
+        if has_video and height:
+            label = f"{height}p {ext.upper()}"
+        elif fmt.get("acodec") and fmt.get("acodec") != "none" and not has_video:
+            label = f"Audio {ext.upper()}"
+        else:
+            label = f"{ext.upper()}"
+
+        formats.append({
+            "id": format_id,
+            "ext": ext,
+            "height": height,
+            "label": label,
+            "filesize": filesize
+        })
+
+    log(f"Parsed {len(formats)} formats from JSON")
+
+    # Sort by height descending, audio at end
+    video_formats = [f for f in formats if f.get("height")]
+    audio_formats = [f for f in formats if not f.get("height")]
+    video_formats.sort(key=lambda x: x["height"] if x["height"] else 0, reverse=True)
+    audio_formats.sort(key=lambda x: x["ext"])
+
+    return video_formats + audio_formats
+
 
 def handle_download(request):
     """Execute yt-dlp download"""
@@ -198,6 +290,7 @@ def handle_download(request):
     # Build command
     cmd = [
         ytdlp,
+        "--no-playlist",
         "--progress",
         "-o", os.path.join(download_path, "%(title)s.%(ext)s")
     ]
@@ -210,11 +303,19 @@ def handle_download(request):
     if quality == "audio":
         cmd.extend(["-x", "--audio-format", "mp3"])
     elif quality == "best":
+        # Merge best video + best audio for highest quality with sound
         cmd.extend(["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"])
+    elif quality.isdigit():
+        # Format ID directly (from list-formats) - MUST combine with audio
+        # Use format+bestaudio to ensure we get audio too
+        cmd.extend(["-f", f"{quality}+bestaudio", "--merge-output-format", "mp4"])
     else:
         # Parse quality like "1080p" -> height<=1080
         height = quality.rstrip('p')
-        cmd.extend(["-f", f"bestvideo[height<={height}]+bestaudio/best[height<={height}]", "--merge-output-format", "mp4"])
+        if height.isdigit():
+            cmd.extend(["-f", f"best[height<={height}]+bestaudio/best[height<={height}]", "--merge-output-format", "mp4"])
+        else:
+            cmd.extend(["-f", "best", "--merge-output-format", "mp4"])
 
     cmd.append(url)
 
@@ -222,6 +323,7 @@ def handle_download(request):
 
     log(f"Command to execute: {' '.join(cmd)}")
 
+    process = None
     try:
         process = subprocess.Popen(
             cmd,
@@ -231,24 +333,32 @@ def handle_download(request):
             bufsize=1
         )
 
-        output_lines = []
+        destination_file = None
+        last_progress = -1
         for line in process.stdout:
-            output_lines.append(line.strip())
             log(f"yt-dlp output: {line.strip()}")
+
+            # Capture destination filename
+            if "Destination:" in line:
+                dest_start = line.find("Destination:") + len("Destination: ")
+                destination_file = line[dest_start:].strip()
+                log(f"Captured destination: {destination_file}")
+
             progress = parse_progress(line)
             if progress is not None:
-                if progress >= 0:
-                    send_message({
-                        "type": "progress",
-                        "percent": progress,
-                        "status": f"正在下载中... {progress:.1f}%"
-                    })
-                else:
-                    send_message({
-                        "type": "progress",
-                        "percent": 0,
-                        "status": "正在下载中..."
-                    })
+                if progress != last_progress or abs(progress - last_progress) > 5:
+                    last_progress = progress
+                    if progress >= 0:
+                        if not send_message({
+                            "type": "progress",
+                            "percent": progress,
+                            "status": f"正在下载中... {progress:.1f}%"
+                        }):
+                            # Pipe broken, stop sending progress but keep downloading
+                            pass
+                    else:
+                        # Fragment download - throttle these messages
+                        pass
 
             if "Merging" in line or "Merged" in line:
                 send_message({"type": "progress", "percent": 95, "status": "正在合并音视频..."})
@@ -258,36 +368,69 @@ def handle_download(request):
         return_code = process.wait()
 
         log(f"yt-dlp return code: {return_code}")
-        log(f"yt-dlp output lines: {output_lines[-10:]}")
 
         if return_code == 0:
-            # Find the downloaded file
-            file_path = find_downloaded_file(download_path, title)
+            # Use captured destination file if available, otherwise find it
+            if destination_file and os.path.exists(destination_file):
+                file_path = destination_file
+                log(f"Using captured destination: {file_path}")
+            else:
+                file_path = find_downloaded_file(download_path, title)
+                log(f"Using find_downloaded_file result: {file_path}")
             send_message({
                 "type": "complete",
                 "filePath": file_path,
                 "status": "下载完成！"
             })
         else:
+            log(f"yt-dlp failed with return code: {return_code}")
             ytdlp_ver = get_ytdlp_version() or "unknown"
             send_message({"type": "error", "message": f"下载失败，错误码: {return_code} (yt-dlp: {ytdlp_ver})"})
 
+    except (BrokenPipeError, OSError):
+        # Chrome disconnected the native messaging port
+        # Kill the yt-dlp subprocess if still running
+        log("BrokenPipeError: Chrome disconnected, killing yt-dlp subprocess")
+        if process and process.poll() is None:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+                log("yt-dlp subprocess terminated")
+            except Exception as ke:
+                log(f"Error killing yt-dlp: {ke}")
+        # Don't try to send an error message - the pipe is broken
     except FileNotFoundError:
         send_message({"type": "error", "message": "找不到 yt-dlp，请确保已安装"})
     except Exception as e:
+        log(f"handle_download exception: {e}")
+        if process and process.poll() is None:
+            try:
+                process.kill()
+                log("yt-dlp subprocess terminated due to error")
+            except:
+                pass
         send_message({"type": "error", "message": str(e)})
 
 def find_downloaded_file(directory, title):
     """Find the downloaded file"""
     try:
         files = sorted(Path(directory).iterdir(), key=os.path.getmtime, reverse=True)
+        log(f"Files in {directory}: {[f.name for f in files[:10]]}")
+        for f in files:
+            if f.is_file():
+                # Check for merged mp4 first (has audio)
+                if f.suffix == '.mp4' and f.stat().st_size > 1000000:
+                    log(f"Found mp4 file: {f.name} size={f.stat().st_size}")
+                    return str(f)
         for f in files:
             if f.is_file() and (title.lower() in f.stem.lower() or f.suffix in ['.mp4', '.mp3', '.mkv', '.webm']):
                 return str(f)
         if files:
-            return str(files[0])
-    except:
-        pass
+            for f in files:
+                if f.is_file() and f.suffix in ['.mp4', '.webm', '.mkv']:
+                    return str(f)
+    except Exception as e:
+        log(f"Error finding file: {e}")
     return directory
 
 def handle_open_file(request):
@@ -323,13 +466,12 @@ def handle_open_folder(request):
 def main():
     """Read JSON messages from stdin and process"""
     log("main() started, waiting for input")
-    import struct
     while True:
         try:
             # Read 4-byte length prefix (Native Messaging protocol)
             length_bytes = sys.stdin.buffer.read(4)
             if not length_bytes or len(length_bytes) < 4:
-                log("No data or incomplete length bytes")
+                log("No data or incomplete length bytes, exiting")
                 break
 
             # Unpack as little-endian unsigned int
@@ -383,6 +525,9 @@ def main():
                     "latestVersion": version,  # Assume current is latest if we can't check
                     "needsUpdate": False
                 })
+            elif action == "listFormats":
+                log("Listing formats")
+                handle_list_formats(request)
             elif action == "checkAndUpdate":
                 # Check latest and update if needed - only called after download failure
                 latest = get_latest_ytdlp_version()
@@ -412,12 +557,20 @@ def main():
             else:
                 send_message({"type": "error", "message": f"Unknown action: {action}"})
 
+        except (BrokenPipeError, OSError):
+            # Chrome disconnected stdin/stdout, clean exit
+            log("Chrome disconnected, exiting gracefully")
+            break
         except json.JSONDecodeError as e:
             log(f"JSONDecodeError: {e}")
             send_message({"type": "error", "message": "Invalid JSON"})
         except Exception as e:
-            log(f"Exception: {e}")
-            send_message({"type": "error", "message": str(e)})
+            log(f"Exception in main loop: {type(e).__name__}: {e}")
+            try:
+                send_message({"type": "error", "message": str(e)})
+            except (BrokenPipeError, OSError):
+                log("Cannot send error (broken pipe), exiting")
+                break
 
 if __name__ == "__main__":
     main()

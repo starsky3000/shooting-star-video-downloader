@@ -1,10 +1,14 @@
 // StarDownload Content Script - Runs on YouTube pages
 
-// Listen for messages from popup
+// Listen for messages from popup or background
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getVideoInfo') {
     const videoInfo = getVideoInfo();
     sendResponse({ success: !!videoInfo, data: videoInfo });
+  } else if (request.action === 'ping') {
+    // Respond to ping from background script
+    const hasVideo = window.location.href.includes('/watch?v=');
+    sendResponse({ hasVideo: hasVideo });
   }
   return true;
 });
@@ -46,34 +50,16 @@ function getVideoId(url) {
 
 // Extract video title
 function getVideoTitle() {
-  // Method 1: From meta tag
-  const metaTitle = document.querySelector('meta[name="title"]');
-  if (metaTitle) {
-    return metaTitle.getAttribute('content').replace(' - YouTube', '');
-  }
-
-  // Method 2: From og:title meta tag
-  const ogTitle = document.querySelector('meta[property="og:title"]');
-  if (ogTitle) {
-    return ogTitle.getAttribute('content').replace(' - YouTube', '');
-  }
-
-  // Method 3: From title tag
-  const titleTag = document.querySelector('title');
-  if (titleTag) {
-    return titleTag.textContent.replace(' - YouTube', '').trim();
-  }
-
-  return '未知标题';
+  // Document title is most reliable after SPA navigation
+  // Clean it: remove "- YouTube" suffix and unread count like "(2)" at the START
+  let title = document.title.replace(/ - YouTube$/, '').trim();
+  title = title.replace(/^\s*\(\d+\)\s*/, '').trim();
+  return title || '未知标题';
 }
 
-// Get the best available thumbnail
+// Get the smaller thumbnail (default size)
 function getThumbnail(videoId) {
-  // Try maxresdefault first (best quality)
-  const maxRes = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
-
-  // If maxresdefault fails, we'll use hqdefault as fallback
-  return maxRes;
+  return `https://i.ytimg.com/vi/${videoId}/default.jpg`;
 }
 
 // For backwards compatibility with older YouTube layouts
