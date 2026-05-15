@@ -13,6 +13,15 @@ let pendingQualityRestore = null;
 // Cache storage reference
 let storageLocal = null;
 
+// OS detection
+function getOS() {
+    const p = (navigator.platform || '').toLowerCase();
+    if (p.includes('win')) return 'win';
+    if (p.includes('mac')) return 'mac';
+    return 'linux';
+}
+const currentOS = getOS();
+
 // DOM Elements
 const thumbnail = document.getElementById('thumbnail');
 const videoTitle = document.getElementById('videoTitle');
@@ -258,7 +267,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     log(`Script execution failed: ${err.message}`);
     // Fallback: get basic info from URL only
     try {
-      const videoId = new URL(tab.url).searchParams.get('v');
+      let videoId = null;
+      // Check /shorts/ first (same pattern as lines 135-137)
+      const shortsMatch = tab.url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
+      if (shortsMatch) {
+        videoId = shortsMatch[1];
+      } else {
+        videoId = new URL(tab.url).searchParams.get('v');
+      }
       if (videoId) {
         currentVideoInfo = {
           url: tab.url,
@@ -450,18 +466,14 @@ function renderDownloadedList() {
 
   downloadedList.innerHTML = displayVideos.map(video => {
     const meta = video.qualityMeta;
-    const resolution = meta?.height ? (meta.height === 2160 ? '4K' : meta.height + 'p') :
-                       qualityToLabel(video.quality);
     const ext = meta?.ext || (video.filePath ? video.filePath.split('.').pop().toUpperCase() : '');
     const sizeStr = formatSize(video.filesize);
-    const metaParts = [resolution, ext, sizeStr].filter(Boolean);
-    const metaText = metaParts.join(' · ');
     return `
     <div class="downloaded-item" data-video-id="${escapeAttr(video.videoId)}" data-path="${escapeAttr(video.filePath)}">
       <img class="thumbnail" src="${escapeAttr(video.thumbnail)}" alt="thumbnail">
       <div class="info">
-        <div class="title">${escapeHtml(video.title)}</div>
-        <div class="meta">${metaText || (video.filePath ? video.filePath.split('/').pop() : '')}</div>
+        <div class="title">${escapeHtml(video.title)}${ext ? ' · ' + ext : ''}</div>
+        <div class="meta">${sizeStr || (video.filePath ? video.filePath.split('/').pop() : '')}</div>
       </div>
       <div class="actions">
         <button class="mini-btn play" data-path="${escapeAttr(video.filePath)}">播放</button>
@@ -743,7 +755,6 @@ function populateQualitySelect(formats) {
       qualitySelect.value = q;
       log(`Restored quality to: ${q}`);
     }
-    pendingQualityRestore = null;
   }
 
   log(`Quality select populated with ${qualitySelect.options.length} options`);
@@ -870,6 +881,7 @@ function startDownload() {
 
   downloadPaused = false;
   downloadComplete = false;
+  pendingQualityRestore = null;
 
   const quality = qualitySelect.value;
   log(`Quality selected: ${quality}`);
@@ -1337,10 +1349,34 @@ function showSetupUI() {
   completionSection.style.display = 'none';
   errorSection.style.display = 'none';
   setupSection.style.display = 'flex';
+
+  // Set OS-specific text
+  const terminalName = currentOS === 'win' ? 'PowerShell' : '终端';
+  const setupTerminalName = document.getElementById('setupTerminalName');
+  const setupTerminalName2 = document.getElementById('setupTerminalName2');
+  if (setupTerminalName) setupTerminalName.textContent = terminalName;
+  if (setupTerminalName2) setupTerminalName2.textContent = terminalName;
+
+  const setupCommandDisplay = document.getElementById('setupCommandDisplay');
+  if (setupCommandDisplay) {
+    setupCommandDisplay.textContent = currentOS === 'win'
+      ? 'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install.ps1"'
+      : 'bash ~/Downloads/install.sh';
+  }
+
+  const setupDownloadHint = document.getElementById('setupDownloadHint');
+  if (setupDownloadHint) {
+    setupDownloadHint.textContent = currentOS === 'win'
+      ? '下载到 %USERPROFILE%\\Downloads'
+      : '下载到 ~/Downloads';
+  }
+
+  // Update install button label
+  downloadInstallBtn.textContent = currentOS === 'win' ? '2. 下载 install.ps1' : '2. 下载 install.sh';
 }
 
-// Generate the install.sh script content as a proper shell script file
-function generateInstallScript(extensionId) {
+// Generate the macOS install.sh script content
+function generateMacInstallScript(extensionId) {
   // NOTE: In JS template literals, \${X} escapes ${X} so it appears literally
   // in the output. The unquoted heredoc below allows bash to expand ${HOME}.
   const lines = [
@@ -1428,6 +1464,175 @@ function generateInstallScript(extensionId) {
   return lines.join('\n');
 }
 
+// Generate the Windows install.ps1 PowerShell script
+function generateWindowsInstallScript(extensionId) {
+  const lines = [
+    '# StarDownload Windows Install Script',
+    '# Run from PowerShell: powershell -ExecutionPolicy Bypass -File install.ps1',
+    '',
+    '$ErrorActionPreference = "Continue"',
+    '',
+    'Write-Host "======================================"',
+    'Write-Host "  StarDownload Installer (Windows)"',
+    'Write-Host "======================================"',
+    'Write-Host ""',
+    '',
+    '# Helper: create registry key recursively (New-Item does NOT create parent keys)',
+    'function New-RegistryKey {',
+    '    param([string]$Path)',
+    '    $parts = $Path -split "\\\\"',
+    '    $current = ""',
+    '    foreach ($part in $parts) {',
+    '        if ($current -eq "") { $current = $part } else { $current = "$current\\$part" }',
+    '        if (!(Test-Path $current)) { New-Item -Path $current -Force | Out-Null }',
+    '    }',
+    '}',
+    '',
+    '# --------------- step 1: set up install directory ---------------',
+    'Write-Host "1/4 Setting up install directory..."',
+    '$appDir = "$env:LOCALAPPDATA\\StarDownload"',
+    'New-Item -ItemType Directory -Force -Path $appDir | Out-Null',
+    '',
+    '# --------------- step 2: copy stardownload.py ---------------',
+    'Write-Host "2/4 Deploying native host..."',
+    '# Look for stardownload.py alongside this script first, then in Downloads',
+    '$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path',
+    '$pyFile = "$scriptDir\\native\\stardownload.py"',
+    'if (-not (Test-Path $pyFile)) {',
+    '    $pyFile = "$env:USERPROFILE\\Downloads\\stardownload.py"',
+    '}',
+    'if (-not (Test-Path $pyFile)) {',
+    '    Write-Error "Cannot find stardownload.py. Please download it first."',
+    '    exit 1',
+    '}',
+    'Copy-Item $pyFile "$appDir\\stardownload.py" -Force',
+    'Write-Host "  Deployed to $appDir\\stardownload.py"',
+    '',
+    '# Create stardownload.bat wrapper',
+    '$batFile = "$appDir\\stardownload.bat"',
+    'Set-Content -Path $batFile -Value "@echo off`r`npy `"%~dp0stardownload.py`" %*" -Encoding ASCII',
+    'Write-Host "  Created stardownload.bat wrapper"',
+    '',
+    '# --------------- step 3: register native messaging host ---------------',
+    'Write-Host "3/4 Registering browser Native Host..."',
+    '',
+    '# Write manifest JSON file',
+    '$manifestJson = @{',
+    '    name = "com.stardownload.host"',
+    '    description = "StarDownload Native Messaging Host"',
+    '    path = "$appDir\\stardownload.bat"',
+    '    type = "stdio"',
+    '    allowed_origins = @("chrome-extension://' + extensionId + '/")',
+    '} | ConvertTo-Json',
+    '',
+    '# Check which browsers are installed',
+    '$browsers = @()',
+    'if (Test-Path "$env:LOCALAPPDATA\\Google\\Chrome") {',
+    '    Write-Host "  Detected: Chrome"',
+    '    $browsers += @{',
+    '        Name = "Chrome"',
+    '        Dir = "$env:LOCALAPPDATA\\Google\\Chrome"',
+    '        RegKey = "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.stardownload.host"',
+    '    }',
+    '}',
+    'if (Test-Path "$env:LOCALAPPDATA\\Microsoft\\Edge") {',
+    '    Write-Host "  Detected: Edge"',
+    '    $browsers += @{',
+    '        Name = "Edge"',
+    '        Dir = "$env:LOCALAPPDATA\\Microsoft\\Edge"',
+    '        RegKey = "HKCU:\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.stardownload.host"',
+    '    }',
+    '}',
+    'if (Test-Path "$env:LOCALAPPDATA\\BraveSoftware\\Brave-Browser") {',
+    '    Write-Host "  Detected: Brave"',
+    '    $browsers += @{',
+    '        Name = "Brave"',
+    '        Dir = "$env:LOCALAPPDATA\\BraveSoftware\\Brave-Browser"',
+    '        RegKey = "HKCU:\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\com.stardownload.host"',
+    '    }',
+    '}',
+    '',
+    'if ($browsers.Count -eq 0) {',
+    '    Write-Host "  No Chromium browser detected. Writing default Chrome config."',
+    '    $browsers += @{',
+    '        Name = "Chrome (default)"',
+    '        Dir = "$env:LOCALAPPDATA\\Google\\Chrome"',
+    '        RegKey = "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.stardownload.host"',
+    '    }',
+    '}',
+    '',
+    'foreach ($browser in $browsers) {',
+    '    try {',
+    '        # Write JSON manifest file to browser dir',
+    '        $targetDir = "$($browser.Dir)\\NativeMessagingHosts"',
+    '        New-Item -ItemType Directory -Force -Path $targetDir | Out-Null',
+    '        Set-Content -Path "$targetDir\\com.stardownload.host.json" -Value $manifestJson -Encoding UTF8',
+    '        # Create registry key recursively',
+    '        $parentKey = Split-Path $browser.RegKey -Parent',
+    '        New-RegistryKey $parentKey',
+    '        New-Item -Path $browser.RegKey -Force | Out-Null',
+    '        Set-ItemProperty -Path $browser.RegKey -Name "(default)" -Value "$targetDir\\com.stardownload.host.json"',
+    '        Write-Host "  $($browser.Name): registered"',
+    '    } catch {',
+    '        Write-Warning "  $($browser.Name): registration failed - $_"',
+    '    }',
+    '}',
+    '',
+    '# --------------- step 4: install dependencies ---------------',
+    'Write-Host "4/4 Installing dependencies..."',
+    '',
+    '# Find Python (use py launcher to bypass Microsoft Store redirect)',
+    '$pythonCmd = $null',
+    'if (Get-Command py -ErrorAction SilentlyContinue) { $pythonCmd = "py" }',
+    'if (-not $pythonCmd) {',
+    '    foreach ($ver in @(313, 312, 311, 310, 39, 38)) {',
+    '        $p = "$env:LOCALAPPDATA\\Programs\\Python\\Python$ver\\python.exe"',
+    '        if (Test-Path $p) { $pythonCmd = $p; break }',
+    '    }',
+    '}',
+    'if (-not $pythonCmd) {',
+    '    Write-Warning "Python not found. Install from https://www.python.org/downloads/"',
+    '} else {',
+    '    Write-Host "  Installing yt-dlp via pip..."',
+    '    & $pythonCmd -m pip install --upgrade yt-dlp *>$null',
+    '    # Add Scripts to PATH',
+    '    $scriptsDir = & $pythonCmd -c "import sysconfig; print(sysconfig.get_path(\"scripts\"))" 2>$null',
+    '    if ($scriptsDir) { $env:PATH = "$scriptsDir;$env:PATH" }',
+    '    Write-Host "  yt-dlp installed"',
+    '}',
+    '',
+    'Write-Host "  Checking ffmpeg..."',
+    'if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {',
+    '    Write-Host "  ffmpeg already installed"',
+    '} else {',
+    '    try {',
+    '        winget install Gyan.FFmpeg --accept-source-agreements --accept-package-agreements',
+    '        Write-Host "  ffmpeg installed"',
+    '    } catch {',
+    '        Write-Warning "ffmpeg install failed. Install manually: https://ffmpeg.org/download.html"',
+    '    }',
+    '}',
+    '',
+    '# --------------- done ---------------',
+    'Write-Host ""',
+    'Write-Host "======================================"',
+    'Write-Host "  Installation complete!"',
+    'Write-Host "======================================"',
+    'Write-Host ""',
+    'Write-Host "Next: close and reopen your browser, then open the extension."',
+    'Write-Host ""'
+  ];
+  return lines.join('\r\n');
+}
+
+// Dispatch to OS-specific install script
+function generateInstallScript(extensionId) {
+  if (currentOS === 'win') {
+    return generateWindowsInstallScript(extensionId);
+  }
+  return generateMacInstallScript(extensionId);
+}
+
 // Download a file as blob to user's downloads folder (stardownload.py)
 async function downloadStardownloadPy() {
   try {
@@ -1443,7 +1648,8 @@ async function downloadStardownloadPy() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    setupHint.textContent = '\u2713 stardownload.py 已下载到 ~/Downloads';
+    const downloadPath = currentOS === 'win' ? '%USERPROFILE%\\Downloads' : '~/Downloads';
+    setupHint.textContent = '\u2713 stardownload.py 已下载到 ' + downloadPath;
     setupHint.style.color = '#02CF66';
   } catch (e) {
     log(`stardownload.py download failed: ${e.message}`);
@@ -1452,20 +1658,22 @@ async function downloadStardownloadPy() {
   }
 }
 
-// Download install.sh to user's downloads folder
+// Download install script to user's downloads folder
 function downloadInstallScript() {
   const extensionId = chrome.runtime.id;
   const content = generateInstallScript(extensionId);
+  const filename = currentOS === 'win' ? 'install.ps1' : 'install.sh';
   const blob = new Blob([content], { type: 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'install.sh';
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  setupHint.textContent = '\u2713 install.sh 已下载到 ~/Downloads';
+  const downloadPath = currentOS === 'win' ? '%USERPROFILE%\\Downloads' : '~/Downloads';
+  setupHint.textContent = '\u2713 ' + filename + ' 已下载到 ' + downloadPath;
   setupHint.style.color = '#02CF66';
 }
 
@@ -1481,7 +1689,10 @@ function setupEventListeners() {
 
   copyRunCmdBtn.addEventListener('click', async () => {
     try {
-      await navigator.clipboard.writeText('bash ~/Downloads/install.sh');
+      const cmd = currentOS === 'win'
+        ? 'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install.ps1"'
+        : 'bash ~/Downloads/install.sh';
+      await navigator.clipboard.writeText(cmd);
       setupHint.textContent = '\u2713 命令已复制';
       setupHint.style.color = '#02CF66';
     } catch (e) {
@@ -1516,14 +1727,17 @@ function setupEventListeners() {
     renderDownloadedList();
     // Collapse video info section when expanding the downloaded list
     if (downloadedListExpanded && downloadedVideos.length > 3) {
+      const videoHeight = currentVideo.offsetHeight;
       currentVideo.style.display = 'none';
       downloadBtn.style.display = 'none';
       downloadActions.style.display = 'none';
       progressSection.style.display = 'none';
       completionSection.style.display = 'none';
       errorSection.style.display = 'none';
+      downloadedList.style.maxHeight = (260 + videoHeight) + 'px';
     } else {
       currentVideo.style.display = 'block';
+      downloadedList.style.maxHeight = '260px';
     }
   });
 

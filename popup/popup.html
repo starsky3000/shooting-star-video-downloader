@@ -19,14 +19,15 @@
       <div class="setup-icon">&#9888;</div>
       <h2 class="setup-title">首次使用需要安装</h2>
       <p class="setup-desc">扩展需要配置 JSON、Native Host 并安装 yt-dlp、ffmpeg。</p>
-      <p class="setup-desc">请依次下载以下两个文件，然后在终端运行安装脚本：</p>
+      <p class="setup-desc">请依次下载以下两个文件，然后在<span id="setupTerminalName">终端</span>运行安装脚本：</p>
       <button id="downloadScriptBtn" class="download-script-btn">1. 下载 stardownload.py</button>
       <button id="downloadInstallBtn" class="install-script-btn">2. 下载 install.sh</button>
-      <p class="setup-desc">然后在终端中运行：</p>
+      <p class="setup-desc">然后在<span id="setupTerminalName2">终端</span>中运行：</p>
       <div class="run-command-row">
-        <code>bash ~/Downloads/install.sh</code>
+        <code id="setupCommandDisplay">bash ~/Downloads/install.sh</code>
         <button id="copyRunCmdBtn" class="copy-cmd-btn">复制</button>
       </div>
+      <div class="setup-desc" id="setupDownloadHint">下载到 ~/Downloads</div>
       <div class="setup-hint" id="setupHint"></div>
     </div>
 

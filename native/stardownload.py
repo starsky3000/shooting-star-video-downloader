@@ -10,10 +10,20 @@ import os
 import subprocess
 import re
 import struct
+import shutil
 import datetime
 from pathlib import Path
 
-LOG_FILE = os.path.expanduser("~/Library/Logs/stardownload.log")
+def get_log_path():
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Logs/stardownload.log")
+    elif sys.platform == "win32":
+        localappdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        return os.path.join(localappdata, "StarDownload", "stardownload.log")
+    else:
+        return os.path.expanduser("~/.cache/stardownload.log")
+
+LOG_FILE = get_log_path()
 
 def log(message):
     """Write log to file"""
@@ -29,40 +39,42 @@ REQUIRED_VERSION = "2026.03.17"
 def get_ytdlp_path():
     """Find yt-dlp binary"""
     log("get_ytdlp_path called")
-    # Check for newer version first (pipx-installed version at ~/.local/bin)
-    newer_paths = [
-        os.path.expanduser("~/.local/bin/yt-dlp"),
-        os.path.expanduser("~/Library/Python/3.9/bin/yt-dlp"),
-    ]
-    for path in newer_paths:
+    # Use shutil.which() first (cross-platform, handles .exe on Windows)
+    for cmd in ["yt-dlp", "ytdlp"]:
+        found = shutil.which(cmd)
+        if found:
+            log(f"Found yt-dlp via shutil.which: {found}")
+            return found
+
+    # Check platform-specific paths
+    if sys.platform == "darwin":
+        specific_paths = [
+            os.path.expanduser("~/.local/bin/yt-dlp"),
+            os.path.expanduser("~/Library/Python/3.9/bin/yt-dlp"),
+            "/usr/local/bin/yt-dlp",
+            "/usr/local/bin/ytdlp",
+            "/opt/homebrew/bin/yt-dlp",
+        ]
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        specific_paths = [
+            os.path.join(appdata, "Python", "Scripts", "yt-dlp.exe"),
+            os.path.join(localappdata, "Programs", "Python", "Scripts", "yt-dlp.exe"),
+            os.path.join(localappdata, "Programs", "Python", "Python312", "Scripts", "yt-dlp.exe"),
+            os.path.join(localappdata, "Programs", "Python", "Python311", "Scripts", "yt-dlp.exe"),
+            os.path.join(localappdata, "Programs", "Python", "Python310", "Scripts", "yt-dlp.exe"),
+            os.path.join(localappdata, "Microsoft", "WinGet", "Packages", "yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe", "yt-dlp.exe"),
+        ]
+    else:
+        specific_paths = []
+
+    for path in specific_paths:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             log(f"Found yt-dlp at: {path}")
             return path
 
-    # Check PATH first
-    for cmd in ["yt-dlp", "ytdlp"]:
-        try:
-            result = subprocess.run(["which", cmd], capture_output=True, text=True)
-            if result.returncode == 0:
-                log(f"Found yt-dlp at: {result.stdout.strip()}")
-                return result.stdout.strip()
-        except:
-            pass
-
-    # Check common installation paths
-    common_paths = [
-        "/usr/local/bin/yt-dlp",
-        "/usr/local/bin/ytdlp",
-        "/opt/homebrew/bin/yt-dlp",
-        str(Path.home() / ".local" / "bin" / "yt-dlp"),
-    ]
-
-    for path in common_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            log(f"Found yt-dlp at common path: {path}")
-            return path
-
-    log("yt-dlp not found in common paths, returning 'yt-dlp' to rely on PATH")
+    log("yt-dlp not found, returning 'yt-dlp' to rely on PATH")
     return "yt-dlp"
 
 def get_ytdlp_version():
@@ -108,12 +120,33 @@ def needs_update():
 
 def get_ffmpeg_path():
     """Find ffmpeg binary, returns (path, found) tuple"""
-    paths = [
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/usr/bin/ffmpeg",
-    ]
-    log(f"get_ffmpeg_path: checking paths={paths}")
+    # Use shutil.which() first (cross-platform)
+    found = shutil.which("ffmpeg")
+    if found:
+        log(f"Found ffmpeg via shutil.which: {found}")
+        return (found, True)
+
+    # Platform-specific fallback paths
+    if sys.platform == "darwin":
+        paths = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg",
+        ]
+    elif sys.platform == "win32":
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        programfiles = os.environ.get("ProgramFiles", "")
+        paths = [
+            os.path.join(localappdata, "ffmpeg", "bin", "ffmpeg.exe"),
+            os.path.join(programfiles, "ffmpeg", "bin", "ffmpeg.exe"),
+        ]
+    else:
+        paths = [
+            "/usr/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg",
+        ]
+
+    log(f"get_ffmpeg_path: checking fallback paths={paths}")
     for p in paths:
         exists = os.path.isfile(p)
         executable = exists and os.access(p, os.X_OK)
@@ -121,15 +154,7 @@ def get_ffmpeg_path():
         if exists and executable:
             log(f"  => Found ffmpeg at: {p}")
             return (p, True)
-    try:
-        result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
-        if result.returncode == 0:
-            path = result.stdout.strip()
-            if os.path.isfile(path):
-                log(f"  => Found ffmpeg via which: {path}")
-                return (path, True)
-    except:
-        pass
+
     log("  => ffmpeg NOT FOUND")
     return ("ffmpeg", False)
 
@@ -145,7 +170,7 @@ def get_default_download_path():
 def update_ytdlp():
     """Update yt-dlp to latest version"""
     log("Updating yt-dlp...")
-    # Try pipx first (for user-installed)
+    # Try pipx first (cross-platform)
     try:
         result = subprocess.run(["pipx", "upgrade", "yt-dlp"], capture_output=True, text=True, timeout=60)
         if result.returncode == 0:
@@ -154,26 +179,33 @@ def update_ytdlp():
     except:
         pass
 
-    # Try direct pip install
-    try:
-        user_python = os.path.expanduser("~/Library/Python/3.9/bin/python3")
-        if os.path.exists(user_python):
-            result = subprocess.run([user_python, "-m", "pip", "install", "--user", "-U", "yt-dlp"],
+    if sys.platform == "win32":
+        # Windows: try winget first
+        try:
+            result = subprocess.run(["winget", "upgrade", "yt-dlp"], capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                log("yt-dlp updated via winget")
+                return True
+        except:
+            pass
+        # Windows: try py launcher with pip
+        try:
+            result = subprocess.run(["py", "-m", "pip", "install", "-U", "yt-dlp"],
                                   capture_output=True, text=True, timeout=120)
             if result.returncode == 0:
-                log("yt-dlp updated via pip")
+                log("yt-dlp updated via py -m pip")
                 return True
-    except:
-        pass
-
-    # Try homebrew
-    try:
-        result = subprocess.run(["brew", "upgrade", "yt-dlp"], capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            log("yt-dlp updated via homebrew")
-            return True
-    except:
-        pass
+        except:
+            pass
+    else:
+        # macOS: try homebrew
+        try:
+            result = subprocess.run(["brew", "upgrade", "yt-dlp"], capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                log("yt-dlp updated via homebrew")
+                return True
+        except:
+            pass
 
     log("Failed to update yt-dlp via all methods")
     return False

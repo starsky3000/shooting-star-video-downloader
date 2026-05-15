@@ -26,7 +26,8 @@
       "mcp__ide__getDiagnostics",
       "Bash(open:*)",
       "Bash(chmod:*)",
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(xxd:*)"
     ]
   }
 }
