@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Shooting Star Download",
-  "version": "1.0.19",
+"version": "1.0.25",
   "description": "一键下载 YouTube 视频",
   "permissions": [
     "activeTab",

@@ -252,6 +252,26 @@ def handle_list_formats(request):
         send_message({"type": "error", "message": str(e)})
 
 
+def get_codec_name(codec):
+    """Map raw codec string to human-readable name"""
+    if not codec or codec == "none":
+        return ""
+    if codec.startswith("avc1"):
+        return "H.264"
+    if codec.startswith("av01"):
+        return "AV1"
+    if codec.startswith("vp9"):
+        return "VP9"
+    if codec.startswith("vp8"):
+        return "VP8"
+    if codec.startswith("mp4a"):
+        return "AAC"
+    if codec == "opus":
+        return "Opus"
+    if codec == "vorbis":
+        return "Vorbis"
+    return codec
+
 def parse_formats_from_json(output):
     """Parse format list from yt-dlp JSON output"""
     data = json.loads(output)
@@ -266,14 +286,19 @@ def parse_formats_from_json(output):
         ext = fmt.get("ext", "")
         height = fmt.get("height")
         filesize = fmt.get("filesize")
+        vcodec = fmt.get("vcodec", "")
+        acodec = fmt.get("acodec", "")
 
-        # Check if this is a video format (has resolution)
-        has_video = fmt.get("vcodec") and fmt.get("vcodec") != "none"
+        # Check if this is a video format
+        has_video = vcodec and vcodec != "none"
         if has_video and height:
+            codec = get_codec_name(vcodec)
             label = f"{height}p {ext.upper()}"
-        elif fmt.get("acodec") and fmt.get("acodec") != "none" and not has_video:
+        elif acodec and acodec != "none" and not has_video:
+            codec = get_codec_name(acodec)
             label = f"Audio {ext.upper()}"
         else:
+            codec = ""
             label = f"{ext.upper()}"
 
         formats.append({
@@ -281,7 +306,8 @@ def parse_formats_from_json(output):
             "ext": ext,
             "height": height,
             "label": label,
-            "filesize": filesize
+            "filesize": filesize,
+            "codec": codec
         })
 
     log(f"Parsed {len(formats)} formats from JSON")
@@ -301,6 +327,7 @@ def handle_download(request):
     quality = request.get("quality", "best")
     title = request.get("title", "video")
     proxy = request.get("proxy")  # Optional proxy
+    quality_meta = request.get("qualityMeta")  # Optional: {height, ext, filesize}
 
     log(f"handle_download called with url={url}, quality={quality}")
 
@@ -314,13 +341,12 @@ def handle_download(request):
     ytdlp = get_ytdlp_path()
     log(f"Using yt-dlp at: {ytdlp}")
 
-    # Build command
+    # Build command (without -o yet — will be set after format detection)
     cmd = [
         ytdlp,
         "--no-playlist",
         "--progress",
         "--newline",
-        "-o", os.path.join(download_path, "%(title)s.%(ext)s")
     ]
 
     # Add proxy if specified
@@ -338,9 +364,13 @@ def handle_download(request):
 
     # Format based on quality — always enforce MP4 video stream to avoid
     # WebM/VP9 in MP4 container which produces unplayable files.
+    # Build output template with quality suffix to avoid filename collisions
+    # when the same video is downloaded at different resolutions.
     format_string = None
+    out_template = "%(title)s.%(ext)s"
     if quality == "audio":
         format_string = "audio-only"
+        out_template = "%(title)s (audio).%(ext)s"
         cmd.extend(["-x", "--audio-format", "mp3"])
     elif quality == "best":
         if can_merge:
@@ -352,9 +382,25 @@ def handle_download(request):
             log("ffmpeg not found, using pre-muxed format (max 720p)")
     elif quality.isdigit():
         # Format ID directly from list-formats
+        # Use quality_meta to add resolution suffix to output template
+        # so different formats of the same video get unique filenames
+        if quality_meta and quality_meta.get("height"):
+            h = quality_meta["height"]
+            label = "4K" if h == 2160 else f"{h}p"
+            codec = quality_meta.get("codec", "")
+            if codec:
+                label += f" {codec}"
+            out_template = f"%(title)s ({label}).%(ext)s"
+        ext_meta2 = (quality_meta.get("ext") or "").lower() if quality_meta else ""
+        is_webm = ext_meta2 == "webm"
         if can_merge:
-            format_string = f"{quality}+bestaudio[ext=m4a]/best[ext=mp4]"
-            cmd.extend(["-f", format_string, "--merge-output-format", "mp4"])
+            if is_webm:
+                # WebM: use Opus audio, merge to WebM container
+                format_string = f"{quality}+bestaudio[ext=webm]/best[ext=webm]"
+                cmd.extend(["-f", format_string, "--merge-output-format", "webm"])
+            else:
+                format_string = f"{quality}+bestaudio[ext=m4a]/best[ext=mp4]"
+                cmd.extend(["-f", format_string, "--merge-output-format", "mp4"])
         else:
             format_string = quality
             cmd.extend(["-f", quality])
@@ -363,6 +409,7 @@ def handle_download(request):
         # Parse quality like "1080p" -> height<=1080
         height = quality.rstrip('p')
         if height.isdigit():
+            out_template = f"%(title)s ({height}p).%(ext)s"
             if can_merge:
                 format_string = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]"
                 cmd.extend(["-f", format_string, "--merge-output-format", "mp4"])
@@ -374,8 +421,10 @@ def handle_download(request):
             format_string = "best[ext=mp4]"
             cmd.extend(["-f", format_string])
 
-    log(f"Quality={quality}, format_string={format_string}, can_merge={can_merge}")
+    log(f"Quality={quality}, format_string={format_string}, can_merge={can_merge}, out_template={out_template}")
 
+    # Add -o AFTER format is determined so the template can include quality info
+    cmd.extend(["-o", os.path.join(download_path, out_template)])
     cmd.append(url)
 
     send_message({"type": "progress", "percent": 0, "status": "正在解析视频信息..."})
@@ -408,6 +457,14 @@ def handle_download(request):
                 log(f"Captured merged file: {merged_file}")
                 download_phase = 3
                 send_message({"type": "progress", "percent": 97, "status": "正在合并音视频..."})
+
+            # Detect already-downloaded file path
+            already_match = re.search(r'\[download\]\s+(.+) has already been downloaded', line)
+            if already_match:
+                already_file = already_match.group(1).strip()
+                log(f"File already downloaded, path: {already_file}")
+                if not destination_file:
+                    destination_file = already_file
 
             # Detect download phase by "Destination:" lines
             if "Destination:" in line:
@@ -473,9 +530,17 @@ def handle_download(request):
                 file_path = destination_file
                 log(f"Using destination (may be audio-only): {file_path}")
             if not file_path:
-                file_path = find_downloaded_file(download_path, title)
+                file_path = find_downloaded_file(download_path, title, quality, quality_meta)
                 log(f"Using find_downloaded_file result: {file_path}")
             log(f"Final returned file: {file_path}")
+            # Remove macOS quarantine attribute so the file can be opened directly
+            if sys.platform == "darwin" and file_path and os.path.isfile(file_path):
+                try:
+                    subprocess.run(["xattr", "-d", "com.apple.quarantine", file_path],
+                                   capture_output=True, timeout=5)
+                    log(f"Removed quarantine from {file_path}")
+                except Exception as qe:
+                    log(f"Quarantine removal failed (non-fatal): {qe}")
             send_message({
                 "type": "complete",
                 "filePath": file_path,
@@ -511,25 +576,68 @@ def handle_download(request):
                 pass
         send_message({"type": "error", "message": str(e)})
 
-def find_downloaded_file(directory, title):
-    """Find the downloaded file - prefer largest recent file (merged result is biggest)"""
-    try:
-        files = [f for f in Path(directory).iterdir() if f.is_file()]
-        # Sort by mod time descending, then by size descending (merged file is biggest and most recent)
-        files.sort(key=lambda f: (os.path.getmtime(f), f.stat().st_size), reverse=True)
-        log(f"Files in {directory}: {[f.name for f in files[:10]]}")
-        # Prefer MP4 with reasonable size (>1MB = definitely has content)
-        for f in files:
-            if f.suffix == '.mp4' and f.stat().st_size > 1000000:
-                log(f"Found merged mp4: {f.name} size={f.stat().st_size}")
-                return str(f)
-        # Fallback: any video file
-        for f in files:
-            if f.suffix in ['.mp4', '.mkv', '.webm', '.mp3']:
-                return str(f)
-    except Exception as e:
-        log(f"Error finding file: {e}")
+def sanitize_title_for_filename(title):
+    """Perform basic character replacements similar to yt-dlp's sanitization"""
+    safe = title
+    safe = safe.replace('/', '_')
+    safe = safe.replace('\\', '_')
+    safe = safe.replace(':', '_')
+    safe = safe.replace('*', '_')
+    safe = safe.replace('?', '_')
+    safe = safe.replace('"', '_')
+    safe = safe.replace('<', '_')
+    safe = safe.replace('>', '_')
+    safe = safe.replace('|', '_')
+    return safe
+
+def find_downloaded_file(directory, title, quality=None, quality_meta=None):
+    """Find the downloaded file by constructing expected filenames from title and quality.
+    Uses os.path.isfile() which works even when directory listing is blocked by macOS TCC."""
+    safe = sanitize_title_for_filename(title)
+    candidates = []
+
+    if quality == "audio":
+        candidates = [f"{safe} (audio).mp3", f"{safe}.mp3"]
+    elif quality_meta and quality_meta.get("height"):
+        h = quality_meta["height"]
+        label = "4K" if h == 2160 else f"{h}p"
+        codec = quality_meta.get("codec", "")
+        if codec:
+            label += f" {codec}"
+        ext_meta = (quality_meta.get("ext") or "").lower()
+        if ext_meta == "webm":
+            candidates = [f"{safe} ({label}).webm", f"{safe} ({label}).mkv"]
+        else:
+            candidates = [f"{safe} ({label}).mp4"]
+    elif quality and quality != "best" and not quality.isdigit():
+        h = quality.rstrip('p')
+        if h.isdigit():
+            candidates = [f"{safe} ({h}p).mp4"]
+
+    candidates.extend([f"{safe}.mp4", f"{safe}.mkv", f"{safe}.webm"])
+
+    for name in candidates:
+        path = os.path.join(directory, name)
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 1000000:
+                log(f"Found constructed path: {path}")
+                return path
+        except OSError:
+            continue
+    log(f"Could not find file at any constructed path in {directory}")
     return directory
+
+def handle_remove_quarantine(request):
+    """Remove macOS quarantine attribute from file"""
+    file_path = request.get("filePath")
+    if not file_path or sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(["xattr", "-d", "com.apple.quarantine", file_path],
+                       capture_output=True, timeout=5)
+        log(f"Removed quarantine from {file_path}")
+    except Exception as e:
+        log(f"removeQuarantine failed: {e}")
 
 def handle_open_file(request):
     """Open file with system default app"""
@@ -547,7 +655,7 @@ def handle_open_file(request):
         send_message({"type": "error", "message": str(e)})
 
 def handle_open_folder(request):
-    """Open folder and reveal file"""
+    """Open the containing folder and select the file"""
     file_path = request.get("filePath")
     if not file_path:
         return
@@ -607,10 +715,24 @@ def main():
             if action == "download":
                 log("Calling handle_download")
                 handle_download(request)
+            elif action == "removeQuarantine":
+                handle_remove_quarantine(request)
             elif action == "openFile":
                 handle_open_file(request)
             elif action == "openFolder":
                 handle_open_folder(request)
+            elif action == "playFile":
+                # Remove macOS quarantine then open the file
+                file_path = request.get("filePath")
+                if file_path and sys.platform == "darwin":
+                    try:
+                        subprocess.run(["xattr", "-d", "com.apple.quarantine", file_path],
+                                       capture_output=True, timeout=5)
+                        log(f"Removed quarantine for play: {file_path}")
+                    except:
+                        pass
+                if file_path:
+                    handle_open_file(request)
             elif action == "ping":
                 log("Sending pong response")
                 send_message({"type": "pong"})

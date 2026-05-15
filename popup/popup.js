@@ -7,6 +7,8 @@ let downloadComplete = false;
 let downloadPaused = false;
 let lastDownloadRequest = null;
 let storageChangeListener = null;
+let downloadedListExpanded = false;
+let pendingQualityRestore = null;
 
 // Cache storage reference
 let storageLocal = null;
@@ -43,6 +45,11 @@ const downloadScriptBtn = document.getElementById('downloadScriptBtn');
 const downloadInstallBtn = document.getElementById('downloadInstallBtn');
 const copyRunCmdBtn = document.getElementById('copyRunCmdBtn');
 const setupHint = document.getElementById('setupHint');
+const moreMenuBtn = document.getElementById('moreMenuBtn');
+const moreMenuDropdown = document.getElementById('moreMenuDropdown');
+const clearAllHistory = document.getElementById('clearAllHistory');
+const showMoreBtn = document.getElementById('showMoreBtn');
+const showMoreWrap = document.getElementById('showMoreWrap');
 
 // Cached video info
 let cachedVideoInfo = null;
@@ -102,14 +109,23 @@ document.addEventListener('DOMContentLoaded', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   log(`Tab URL: ${tab.url}`);
 
-  if (!tab.url || !tab.url.includes('youtube.com/watch')) {
+  // Check if on YouTube video page (watch or shorts)
+  const isYouTubeWatch = tab.url && tab.url.includes('youtube.com/watch');
+  const isYouTubeShorts = tab.url && tab.url.includes('youtube.com/shorts/');
+  if (!isYouTubeWatch && !isYouTubeShorts) {
     log('Not a YouTube watch page');
     showNonVideoError('请在视频播放页打开扩展');
     return;
   }
 
-  // Get current video ID from URL
-  const currentVideoIdFromUrl = new URL(tab.url).searchParams.get('v');
+  // Get current video ID from URL (watch?v=X or /shorts/X)
+  let currentVideoIdFromUrl = null;
+  if (isYouTubeWatch) {
+    currentVideoIdFromUrl = new URL(tab.url).searchParams.get('v');
+  } else if (isYouTubeShorts) {
+    const match = tab.url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
+    if (match) currentVideoIdFromUrl = match[1];
+  }
   log(`Current video ID from URL: ${currentVideoIdFromUrl}`);
 
   // Check if we have cached info for this video — show directly, no loading flash
@@ -137,7 +153,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       target: { tabId: tab.id },
       func: () => {
         const url = location.href;
-        const videoId = new URL(url).searchParams.get('v');
+        let videoId = null;
+        if (url.includes('/shorts/')) {
+          const m = url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
+          if (m) videoId = m[1];
+        } else {
+          videoId = new URL(url).searchParams.get('v');
+        }
 
         // For title: document.title is the most reliable after SPA navigation.
         // Clean it: remove "- YouTube" suffix and unread count like "(2)" at the START.
@@ -339,7 +361,11 @@ function formatSize(bytes) {
   if (bytes >= 1024 * 1024 * 1024) {
     return (bytes / (1024 * 1024 * 1024)).toFixed(1) + 'G';
   }
-  return Math.round(bytes / (1024 * 1024)) + 'MB';
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) {
+    return Math.round(mb) + 'MB';
+  }
+  return mb.toFixed(1) + 'MB';
 }
 
 // Load downloaded videos directly from storage
@@ -368,10 +394,10 @@ function saveDownloadedVideos() {
 function addDownloadedVideo(videoInfo) {
   log('addDownloadedVideo called');
 
-  // Always work with local array first (even if storage fails)
-  const existingIndex = downloadedVideos.findIndex(v => v.videoId === videoInfo.videoId);
-  if (existingIndex >= 0) {
-    downloadedVideos.splice(existingIndex, 1);
+  // Remove duplicate by filePath (same file = same download), but allow same videoId with different formats
+  const dupIndex = downloadedVideos.findIndex(v => v.filePath === videoInfo.filePath);
+  if (dupIndex >= 0) {
+    downloadedVideos.splice(dupIndex, 1);
   }
 
   // Add to beginning
@@ -406,16 +432,23 @@ function addDownloadedVideo(videoInfo) {
   }
 }
 
-// Render downloaded videos list
+// Render downloaded videos list (shows 3 latest, expandable)
 function renderDownloadedList() {
   if (downloadedVideos.length === 0) {
     downloadedTitle.style.display = 'none';
     downloadedList.innerHTML = '';
+    showMoreWrap.style.display = 'none';
+    moreMenuBtn.style.display = 'none';
+    moreMenuDropdown.style.display = 'none';
     return;
   }
 
+  moreMenuBtn.style.display = 'block';
   downloadedTitle.style.display = 'block';
-  downloadedList.innerHTML = downloadedVideos.map(video => {
+  const showAll = downloadedListExpanded || downloadedVideos.length <= 3;
+  const displayVideos = showAll ? downloadedVideos : downloadedVideos.slice(0, 3);
+
+  downloadedList.innerHTML = displayVideos.map(video => {
     const meta = video.qualityMeta;
     const resolution = meta?.height ? (meta.height === 2160 ? '4K' : meta.height + 'p') :
                        qualityToLabel(video.quality);
@@ -437,7 +470,22 @@ function renderDownloadedList() {
     </div>
   `;}).join('');
 
-  // Add event listeners — mini buttons
+  // "Show more" / "Collapse" button
+  if (downloadedVideos.length > 3) {
+    showMoreWrap.style.display = 'flex';
+    showMoreBtn.textContent = showAll ? '收起' : `查看更多 (${downloadedVideos.length - 3})`;
+  } else {
+    showMoreWrap.style.display = 'none';
+  }
+
+  // Add event listeners — whole item clickable to play
+  downloadedList.querySelectorAll('.downloaded-item').forEach(item => {
+    item.addEventListener('click', () => {
+      playDownloaded(item.dataset.path);
+    });
+  });
+
+  // Add event listeners — mini buttons (stop propagation to avoid double-trigger)
   downloadedList.querySelectorAll('.mini-btn.play').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -448,20 +496,6 @@ function renderDownloadedList() {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       openDownloadedFolder(btn.dataset.path);
-    });
-  });
-
-  // Add event listeners — click thumbnail or title to play
-  downloadedList.querySelectorAll('.downloaded-item .thumbnail').forEach(img => {
-    img.addEventListener('click', () => {
-      const item = img.closest('.downloaded-item');
-      if (item) playDownloaded(item.dataset.path);
-    });
-  });
-  downloadedList.querySelectorAll('.downloaded-item .title').forEach(title => {
-    title.addEventListener('click', () => {
-      const item = title.closest('.downloaded-item');
-      if (item) playDownloaded(item.dataset.path);
     });
   });
 }
@@ -495,8 +529,12 @@ function playDownloaded(filePath) {
   log('playDownloaded called, filePath: ' + filePath);
   try {
     const port = chrome.runtime.connectNative('com.stardownload.host');
-    port.postMessage({ action: 'openFile', filePath: filePath });
-    // Don't disconnect immediately - let Chrome flush the message to the native host
+    // Send a single playFile action — native host will remove quarantine
+    // and open the file in one go, avoiding race conditions with port lifetime
+    port.postMessage({ action: 'playFile', filePath: filePath });
+    setTimeout(() => {
+      try { port.disconnect(); } catch(e) {}
+    }, 500);
   } catch (err) {
     log(`playDownloaded error: ${err.message}`);
   }
@@ -592,11 +630,10 @@ function fetchFormatsFromNative(url) {
   }
 }
 
-// Populate quality select with available formats
+// Populate quality select with all available formats
 function populateQualitySelect(formats) {
   qualitySelect.innerHTML = '';
 
-  // Now show the current video section
   showLoadingState(false);
   currentVideo.style.display = 'block';
 
@@ -606,58 +643,107 @@ function populateQualitySelect(formats) {
     return;
   }
 
-  // Find best MP4 option (default)
-  let bestMp4 = null;
-  let hasVideo = false;
-
-  for (const fmt of formats) {
-    // Skip mhtml format - it's not a real video format
-    if (fmt.height && fmt.ext !== 'mhtml') {
-      hasVideo = true;
-      if (fmt.ext === 'mp4' && (!bestMp4 || fmt.height > bestMp4.height)) {
-        bestMp4 = fmt;
-      }
-    }
-  }
-
   // Helper: convert height to display label (e.g. 2160 → 4K)
   const heightLabel = (h) => h === 2160 ? '4K' : `${h}p`;
 
-  // Add video formats (exclude mhtml which is not a real video format)
-  if (hasVideo) {
-    if (bestMp4) {
-      const sizeStr = formatSize(bestMp4.filesize);
-      const label = sizeStr ? `${heightLabel(bestMp4.height)} MP4 ${sizeStr} (最高画质)` : `${heightLabel(bestMp4.height)} MP4 (最高画质)`;
-      addQualityOption(bestMp4.id, label, true);
-    }
+  // Container priority: MP4 first, then others alphabetically
+  const extRank = (ext) => {
+    const e = (ext || '').toLowerCase();
+    if (e === 'mp4') return 0;
+    if (e === 'webm') return 1;
+    return 2;
+  };
 
-    const addedHeights = new Set();
-    if (bestMp4) addedHeights.add(bestMp4.height);
+  // Codec priority: H.264 first (most compatible), then AV1, VP9, VP8, others
+  const codecRank = (codec) => {
+    if (!codec) return 10;
+    if (codec === 'H.264') return 0;
+    if (codec === 'AV1') return 1;
+    if (codec === 'VP9') return 2;
+    if (codec === 'VP8') return 3;
+    if (codec === 'AAC') return 4;
+    if (codec === 'Opus') return 5;
+    return 9;
+  };
 
-    for (const fmt of formats) {
-      // Skip mhtml format - it's not a real video format
-      if (fmt.height && fmt.ext !== 'mhtml' && !addedHeights.has(fmt.height)) {
-        const sizeStr = formatSize(fmt.filesize);
-        const label = fmt.ext === 'mp4'
-          ? (sizeStr ? `${heightLabel(fmt.height)} MP4 ${sizeStr}` : `${heightLabel(fmt.height)} MP4`)
-          : `${heightLabel(fmt.height)} ${fmt.ext.toUpperCase()}${sizeStr ? ' ' + sizeStr : ''}`;
-        addQualityOption(fmt.id, label);
-        addedHeights.add(fmt.height);
-      }
-    }
+  // Separate video and audio formats (exclude mhtml)
+  const videoFmts = formats.filter(f => f.height && f.ext !== 'mhtml');
+  const audioFmts = formats.filter(f => !f.height && f.ext !== 'mhtml');
+
+  // Sort video formats: height desc → container priority → codec priority → size asc
+  videoFmts.sort((a, b) => {
+    if (b.height !== a.height) return b.height - a.height;
+    const extDiff = extRank(a.ext) - extRank(b.ext);
+    if (extDiff !== 0) return extDiff;
+    const codecDiff = codecRank(a.codec) - codecRank(b.codec);
+    if (codecDiff !== 0) return codecDiff;
+    return (a.filesize || 0) - (b.filesize || 0);
+  });
+
+  // Sort audio formats: codec priority → size asc
+  audioFmts.sort((a, b) => {
+    const codecDiff = codecRank(a.codec) - codecRank(b.codec);
+    if (codecDiff !== 0) return codecDiff;
+    return (a.filesize || 0) - (b.filesize || 0);
+  });
+
+  // Default: first MP4 format (highest resolution MP4)
+  let defaultSelected = false;
+  const defaultMp4 = videoFmts.find(f => (f.ext || '').toLowerCase() === 'mp4');
+  if (defaultMp4) defaultMp4._default = true;
+
+  // Build label for a video format
+  const buildVideoLabel = (fmt) => {
+    const h = heightLabel(fmt.height);
+    const parts = [h];
+    if (fmt.codec) parts.push(fmt.codec);
+    parts.push((fmt.ext || '').toUpperCase());
+    const sizeStr = formatSize(fmt.filesize);
+    if (sizeStr) parts.push(sizeStr);
+    return parts.join(' ');
+  };
+
+  // Add video formats
+  for (const fmt of videoFmts) {
+    const label = buildVideoLabel(fmt);
+    const selected = fmt._default || false;
+    addQualityOption(fmt.id, label, selected);
+    if (selected) defaultSelected = true;
   }
 
-  // Add audio formats (exclude mhtml)
-  const audioFormats = formats.filter(f => !f.height && f.ext !== 'mhtml');
-  if (audioFormats.length > 0) {
-    const addedExts = new Set();
-    for (const fmt of audioFormats) {
-      if (!addedExts.has(fmt.ext)) {
-        const sizeStr = formatSize(fmt.filesize);
-        addQualityOption(fmt.id, `音频 ${fmt.ext.toUpperCase()}${sizeStr ? ' ' + sizeStr : ''}`);
-        addedExts.add(fmt.ext);
-      }
+  // Add separator if there are both video and audio formats
+  if (videoFmts.length > 0 && audioFmts.length > 0) {
+    const sep = document.createElement('option');
+    sep.disabled = true;
+    sep.textContent = '────────── 仅音频 ──────────';
+    qualitySelect.appendChild(sep);
+  }
+
+  // Build label for an audio format
+  const buildAudioLabel = (fmt) => {
+    const parts = ['音频'];
+    if (fmt.codec) parts.push(fmt.codec);
+    parts.push((fmt.ext || '').toUpperCase());
+    const sizeStr = formatSize(fmt.filesize);
+    if (sizeStr) parts.push(sizeStr);
+    return parts.join(' ');
+  };
+
+  // Add audio formats
+  for (const fmt of audioFmts) {
+    addQualityOption(fmt.id, buildAudioLabel(fmt));
+  }
+
+  // Restore previously selected quality (e.g. after popup reopen during paused download)
+  if (pendingQualityRestore) {
+    const q = pendingQualityRestore;
+    const match = qualitySelect.querySelector(`option[value="${CSS.escape(q)}"]`);
+    if (match) {
+      match.selected = true;
+      qualitySelect.value = q;
+      log(`Restored quality to: ${q}`);
     }
+    pendingQualityRestore = null;
   }
 
   log(`Quality select populated with ${qualitySelect.options.length} options`);
@@ -701,7 +787,13 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
         title = title.replace(/^\s*\(\d+\)\s*/, '').trim();
 
         let duration = null;
-        const videoId = new URL(location.href).searchParams.get('v');
+        let videoId = null;
+        if (location.href.includes('/shorts/')) {
+          const m = location.href.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
+          if (m) videoId = m[1];
+        } else {
+          videoId = new URL(location.href).searchParams.get('v');
+        }
 
         // Method 1: ytInitialPlayerResponse (reliable but stale on SPA nav)
         try {
@@ -782,7 +874,7 @@ function startDownload() {
   const quality = qualitySelect.value;
   log(`Quality selected: ${quality}`);
 
-  // Capture format metadata (resolution, ext) for downloaded list display
+  // Capture format metadata (resolution, ext, codec) for downloaded list display
   let qualityMeta = null;
   if (cachedFormats) {
     const fmt = cachedFormats.find(f => f.id === quality);
@@ -790,6 +882,7 @@ function startDownload() {
       qualityMeta = {
         height: fmt.height,
         ext: fmt.ext?.toUpperCase() || '',
+        codec: fmt.codec || '',
         filesize: fmt.filesize
       };
     }
@@ -886,6 +979,9 @@ function watchDownloadState() {
       case 'paused':
         updateProgress(state.progress, '下载已暂停');
         showDownloadActions();
+        pauseBtnText.textContent = '继续';
+        pauseBtn.className = 'download-action-btn resume-btn';
+        downloadPaused = true;
         progressSection.style.display = 'block';
         break;
       case 'complete':
@@ -895,7 +991,9 @@ function watchDownloadState() {
           storageChangeListener = null;
         }
         showDownloadBtn();
-        showCompletion(state.filePath);
+        progressBar.style.width = '0%';
+        statusText.textContent = '';
+        progressSection.style.display = 'none';
         // Add to downloaded list
         addDownloadedVideo({
           videoId: currentVideoId,
@@ -970,6 +1068,7 @@ async function restoreDownloadState() {
           downloadBtn.style.display = 'none';
           watchDownloadState();
           // Also fetch formats in background for when download completes
+          pendingQualityRestore = state.quality || null;
           if (currentVideoInfo.url) {
             fetchFormats(currentVideoInfo.url);
           }
@@ -985,18 +1084,18 @@ async function restoreDownloadState() {
           pauseBtn.className = 'download-action-btn resume-btn';
           downloadBtn.style.display = 'none';
           watchDownloadState();
+          pendingQualityRestore = state.quality || null;
           if (currentVideoInfo.url) {
             fetchFormats(currentVideoInfo.url);
           }
           break;
 
         case 'complete':
-          // Show the completed state and add to downloaded list
+          // Add to downloaded list (don't show old completion section)
           downloadComplete = true;
           showDownloadBtn();
           progressSection.style.display = 'none';
           if (state.filePath) {
-            showCompletion(state.filePath);
             // Add to downloaded list
             addDownloadedVideo({
               videoId: currentVideoId,
@@ -1068,11 +1167,9 @@ function updateProgress(percent, status) {
   statusText.textContent = status || `下载中... ${percent.toFixed(1)}%`;
 }
 
-// Show completion state
+// Show completion state (keep video section visible)
 function showCompletion(path) {
-  currentVideo.style.display = 'none';
   completionSection.style.display = 'block';
-  downloadedSection.style.display = 'block'; // Keep downloaded section visible
   filePath.textContent = path;
   downloadComplete = true;
   log('showCompletion - completed section shown');
@@ -1391,5 +1488,47 @@ function setupEventListeners() {
       setupHint.textContent = '复制失败';
       setupHint.style.color = '#ff6b6b';
     }
+  });
+
+  // "..." menu toggle
+  moreMenuBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const visible = moreMenuDropdown.style.display === 'block';
+    moreMenuDropdown.style.display = visible ? 'none' : 'block';
+  });
+
+  // Delete all history
+  clearAllHistory.addEventListener('click', () => {
+    downloadedVideos = [];
+    saveDownloadedVideos();
+    // Also clear in background's storage
+    if (storageLocal) {
+      storageLocal.set({ downloadedVideos: [] });
+    }
+    downloadedListExpanded = false;
+    renderDownloadedList();
+    moreMenuDropdown.style.display = 'none';
+  });
+
+  // "Show more" / "Collapse" button
+  showMoreBtn.addEventListener('click', () => {
+    downloadedListExpanded = !downloadedListExpanded;
+    renderDownloadedList();
+    // Collapse video info section when expanding the downloaded list
+    if (downloadedListExpanded && downloadedVideos.length > 3) {
+      currentVideo.style.display = 'none';
+      downloadBtn.style.display = 'none';
+      downloadActions.style.display = 'none';
+      progressSection.style.display = 'none';
+      completionSection.style.display = 'none';
+      errorSection.style.display = 'none';
+    } else {
+      currentVideo.style.display = 'block';
+    }
+  });
+
+  // Close dropdown on click outside
+  document.addEventListener('click', () => {
+    moreMenuDropdown.style.display = 'none';
   });
 }

@@ -25,7 +25,8 @@
       "Bash(~/.local/bin/yt-dlp:*)",
       "mcp__ide__getDiagnostics",
       "Bash(open:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(node:*)"
     ]
   }
 }

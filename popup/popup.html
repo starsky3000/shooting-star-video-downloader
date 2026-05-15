@@ -47,7 +47,7 @@
         <div class="quality-selector">
           <label for="qualitySelect">画质：</label>
           <select id="qualitySelect">
-            <option value="best">最高画质</option>
+            <option value="loading">获取画质信息中，请稍等...</option>
           </select>
         </div>
 
@@ -94,9 +94,18 @@
 
     <!-- Downloaded Videos Section -->
     <div class="downloaded-section" id="downloadedSection">
-      <h3 class="section-title" id="downloadedTitle">已下载</h3>
+      <div class="section-header">
+        <h3 class="section-title" id="downloadedTitle">已下载</h3>
+        <button class="more-menu-btn" id="moreMenuBtn">...</button>
+        <div class="more-menu-dropdown" id="moreMenuDropdown" style="display: none;">
+          <div class="more-menu-item" id="clearAllHistory">删除全部下载历史</div>
+        </div>
+      </div>
       <div class="downloaded-list" id="downloadedList">
         <!-- Downloaded items will be inserted here -->
+      </div>
+      <div class="show-more-wrap" id="showMoreWrap" style="display: none;">
+        <button class="show-more-btn" id="showMoreBtn">查看更多</button>
       </div>
     </div>
   </div>

@@ -328,11 +328,85 @@ body {
   animation: fadeInUp 0.4s ease 0.3s forwards;
 }
 
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  position: relative;
+}
+
 .section-title {
   font-size: 13px;
   font-weight: 600;
   color: #888888;
-  margin-bottom: 10px;
+  margin-bottom: 0;
+}
+
+.more-menu-btn {
+  background: none;
+  border: none;
+  color: #888888;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  letter-spacing: 1px;
+  outline: none;
+  transition: color 0.2s ease;
+}
+
+.more-menu-btn:hover {
+  color: #ffffff;
+}
+
+.more-menu-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  padding: 4px;
+  z-index: 10;
+  min-width: 140px;
+}
+
+.more-menu-item {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #ff6b6b;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: background 0.2s ease;
+}
+
+.more-menu-item:hover {
+  background: rgba(255, 107, 107, 0.15);
+}
+
+.show-more-wrap {
+  display: flex;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.show-more-btn {
+  background: none;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  color: #888888;
+  font-size: 12px;
+  padding: 6px 16px;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+.show-more-btn:hover {
+  border-color: #02CF66;
+  color: #02CF66;
 }
 
 .downloaded-list {
@@ -341,6 +415,26 @@ body {
   gap: 8px;
   max-height: 260px;
   overflow-y: auto;
+  padding-right: 2px;
+}
+
+/* Dark scrollbar */
+.downloaded-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.downloaded-list::-webkit-scrollbar-track {
+  background: #0a0a0a;
+  border-radius: 3px;
+}
+
+.downloaded-list::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 3px;
+}
+
+.downloaded-list::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
 }
 
 .downloaded-item {
@@ -350,15 +444,22 @@ body {
   background: #0a0a0a;
   border-radius: 8px;
   border: none;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.downloaded-item:hover {
+  background: #222222;
 }
 
 .downloaded-item .thumbnail {
-  width: 80px;
-  height: 45px;
+  width: 106px;
+  height: 60px;
   border-radius: 4px;
   border: none;
   outline: none;
   cursor: pointer;
+  flex-shrink: 0;
 }
 
 .downloaded-item .info {

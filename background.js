@@ -54,7 +54,7 @@ function updateIcon(isYouTubeVideo, hasVideoInfo) {
 function initAllTabsGray() {
   updateIcon(false, false);
   chrome.tabs.query({}, (tabs) => {
-    const youtubeTabs = tabs.filter(t => t.url && t.url.includes('youtube.com/watch'));
+    const youtubeTabs = tabs.filter(t => t.url && (t.url.includes('youtube.com/watch') || t.url.includes('youtube.com/shorts/')));
     youtubeTabs.forEach(tab => {
       checkYouTubeVideoStatus(tab.id, tab.url);
     });
@@ -71,15 +71,19 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // Listen for tab activation changes
 chrome.tabs.onActivated.addListener((activeInfo) => {
   chrome.tabs.get(activeInfo.tabId, (tab) => {
-    if (tab && tab.url) {
-      checkYouTubeVideoStatus(tab.id, tab.url);
+    if (tab) {
+      if (tab.url) {
+        checkYouTubeVideoStatus(tab.id, tab.url);
+      } else {
+        updateIcon(false, false);
+      }
     }
   });
 });
 
-// Check if URL is a YouTube watch page with video
+// Check if URL is a YouTube watch page or shorts with video
 function checkYouTubeVideoStatus(tabId, url) {
-  if (!url || !url.includes('youtube.com/watch')) {
+  if (!url || (!url.includes('youtube.com/watch') && !url.includes('youtube.com/shorts/'))) {
     updateIcon(false, false);
     return;
   }
@@ -90,7 +94,13 @@ function checkYouTubeVideoStatus(tabId, url) {
     chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
-        const videoId = new URL(location.href).searchParams.get('v');
+        let videoId = null;
+        if (location.href.includes('/shorts/')) {
+          const match = location.href.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
+          if (match) videoId = match[1];
+        } else {
+          videoId = new URL(location.href).searchParams.get('v');
+        }
         const videoEl = document.querySelector('video');
         return !!(videoId && videoEl && videoEl.duration);
       },
@@ -113,7 +123,8 @@ function doStartDownload(request) {
     action: 'download',
     url: request.url,
     title: request.title,
-    quality: request.quality
+    quality: request.quality,
+    qualityMeta: request.qualityMeta
   };
 
   if (request.isResume) {
