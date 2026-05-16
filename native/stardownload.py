@@ -211,17 +211,29 @@ def update_ytdlp():
     return False
 
 def parse_progress(line):
-    """Parse yt-dlp progress from stdout/stderr"""
+    """Parse yt-dlp progress from stdout/stderr
+    Returns (percent, speed_str) tuple, or (None, None) if no match."""
     # Match: [download]  45.2% of 123.45MiB at  1.23MiB/s ETA 00:01
     match = re.search(r'\[download\]\s+(\d+\.?\d*)%', line)
     if match:
-        return float(match.group(1))
+        percent = float(match.group(1))
+        speed = None
+        speed_match = re.search(r'at\s+([\d.]+)\s*([KMGT]?)i?B/s', line)
+        if speed_match:
+            value = float(speed_match.group(1))
+            unit = speed_match.group(2) or ''
+            # Convert to bytes/s, then to MB/s
+            mult = {'': 1, 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3}
+            bytes_per_sec = value * mult.get(unit, 1)
+            mb_per_sec = bytes_per_sec / 1_000_000
+            speed = f'{mb_per_sec:.1f}MB/s' if mb_per_sec >= 1 else f'{mb_per_sec:.2f}MB/s'
+        return (percent, speed)
 
     # Match fragments downloading
     if '[download] Downloading fragment' in line:
-        return -1  # Indicate fragment download
+        return (-1, None)  # Indicate fragment download
 
-    return None
+    return (None, None)
 
 def send_message(msg):
     """Send JSON message to stdout using Native Messaging protocol.
@@ -317,7 +329,7 @@ def parse_formats_from_json(output):
         format_id = fmt.get("format_id", "")
         ext = fmt.get("ext", "")
         height = fmt.get("height")
-        filesize = fmt.get("filesize")
+        filesize = fmt.get("filesize") or fmt.get("filesize_approx")
         vcodec = fmt.get("vcodec", "")
         acodec = fmt.get("acodec", "")
 
@@ -342,7 +354,28 @@ def parse_formats_from_json(output):
             "codec": codec
         })
 
-    log(f"Parsed {len(formats)} formats from JSON")
+    # Deduplicate: keep best entry per (height, ext, codec) — prefer one with filesize
+    seen = {}
+    deduped = []
+    for f in formats:
+        if f.get("height") and f.get("codec"):
+            key = (f["height"], f["ext"], f["codec"])
+        elif f.get("codec"):
+            key = ("audio", f["ext"], f["codec"])
+        else:
+            key = ("other", f["ext"], f["id"])
+        if key in seen:
+            existing = seen[key]
+            # Prefer entry with filesize > 0
+            if f.get("filesize") and not existing.get("filesize"):
+                deduped[deduped.index(existing)] = f
+                seen[key] = f
+        else:
+            seen[key] = f
+            deduped.append(f)
+    formats = deduped
+
+    log(f"Parsed {len(raw_formats)} raw formats, {len(formats)} after dedup")
 
     # Sort by height descending, audio at end
     video_formats = [f for f in formats if f.get("height")]
@@ -516,7 +549,7 @@ def handle_download(request):
 
             # Phase-based progress calculation
             if "[download]" in line:
-                progress = parse_progress(line)
+                progress, speed = parse_progress(line)
                 if progress is not None and progress > 0:
                     if can_merge and download_phase >= 2:
                         total_progress = 80 + progress * 0.15
@@ -527,11 +560,14 @@ def handle_download(request):
 
                     if total_progress != last_progress and abs(total_progress - last_progress) > 0.5:
                         last_progress = total_progress
-                        if not send_message({
+                        msg = {
                             "type": "progress",
                             "percent": total_progress,
-                            "status": f"正在下载... {total_progress:.0f}%"
-                        }):
+                            "status": f"正在下载... {total_progress:.0f}%",
+                        }
+                        if speed:
+                            msg["speed"] = speed
+                        if not send_message(msg):
                             pass
 
             if "Post-processing" in line or "Embedding" in line:
@@ -683,6 +719,7 @@ def handle_open_file(request):
     if not file_path:
         return
     try:
+        file_path = os.path.abspath(file_path)
         if sys.platform == "darwin":
             subprocess.run(["open", file_path], check=True)
         elif sys.platform == "win32":
@@ -701,7 +738,9 @@ def handle_open_folder(request):
         if sys.platform == "darwin":
             subprocess.run(["open", "-R", file_path], check=True)
         elif sys.platform == "win32":
-            subprocess.run(["explorer", "/select,", file_path], check=True)
+            # Open the containing folder directly
+            folder = os.path.dirname(os.path.abspath(file_path))
+            os.startfile(folder)
         else:
             subprocess.run(["xdg-open", os.path.dirname(file_path)], check=True)
     except Exception as e:

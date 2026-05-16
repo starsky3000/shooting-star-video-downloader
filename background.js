@@ -277,13 +277,15 @@ function handleDownloadMessage(message) {
         updateDownloadState({
           status: 'downloading',
           progress: adjusted,
-          statusText: message.status
+          statusText: message.status,
+          speed: message.speed || null
         });
       } else {
         updateDownloadState({
           status: 'downloading',
           progress: message.percent,
-          statusText: message.status
+          statusText: message.status,
+          speed: message.speed || null
         });
       }
       break;

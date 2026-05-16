@@ -1117,7 +1117,7 @@ function watchDownloadState() {
         if (!downloadPaused) {
           thickProgress.classList.remove('paused');
           progressPauseBtn.title = '暂停';
-          updateProgress(state.progress, state.statusText);
+          updateProgress(state.progress, state.statusText, state.speed);
           showThickProgress();
         }
         break;
@@ -1315,10 +1315,12 @@ async function tryUpdateYtDlp() {
 }
 
 // Update progress display
-function updateProgress(percent, status) {
+function updateProgress(percent, status, speed) {
   thickProgressFill.style.width = `${percent}%`;
   if (percent <= 0) {
     thickProgressLabel.textContent = '正在下载';
+  } else if (speed) {
+    thickProgressLabel.textContent = speed;
   } else {
     thickProgressLabel.textContent = `${percent.toFixed(1)}%`;
   }
