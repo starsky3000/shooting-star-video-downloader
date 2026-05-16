@@ -360,6 +360,7 @@ def handle_download(request):
     title = request.get("title", "video")
     proxy = request.get("proxy")  # Optional proxy
     quality_meta = request.get("qualityMeta")  # Optional: {height, ext, filesize}
+    is_resume = request.get("isResume", False)  # Whether this is a resume after pause
 
     log(f"handle_download called with url={url}, quality={quality}")
 
@@ -458,6 +459,11 @@ def handle_download(request):
     # Add -o AFTER format is determined so the template can include quality info
     cmd.extend(["-o", os.path.join(download_path, out_template)])
     cmd.append(url)
+
+    # When resuming after a pause, force overwrite partial files from the previous attempt
+    if is_resume:
+        cmd.insert(1, "--force-overwrites")
+        log("isResume=true, added --force-overwrites")
 
     send_message({"type": "progress", "percent": 0, "status": "正在解析视频信息..."})
 

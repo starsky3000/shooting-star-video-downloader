@@ -29,12 +29,14 @@ const durationBadge = document.getElementById('durationBadge');
 const qualitySelect = document.getElementById('qualitySelect');
 const downloadBtn = document.getElementById('downloadBtn');
 const btnText = document.getElementById('btnText');
-const pauseBtn = document.getElementById('pauseBtn');
-const pauseBtnText = document.getElementById('pauseBtnText');
-const cancelBtn = document.getElementById('cancelBtn');
-const downloadActions = document.getElementById('downloadActions');
-const progressSection = document.getElementById('progressSection');
-const progressBar = document.getElementById('progressBar');
+const thickProgress = document.getElementById('thickProgress');
+const thickProgressFill = document.getElementById('thickProgressFill');
+const thickProgressLabel = document.getElementById('thickProgressLabel');
+const thickProgressControls = document.getElementById('thickProgressControls');
+const progressPauseBtn = document.getElementById('progressPauseBtn');
+const progressCancelBtn = document.getElementById('progressCancelBtn');
+const downloadCompleted = document.getElementById('downloadCompleted');
+const refreshBtn = document.getElementById('refreshBtn');
 const statusText = document.getElementById('statusText');
 const completionSection = document.getElementById('completionSection');
 const successText = document.getElementById('successText');
@@ -67,14 +69,24 @@ let cachedVideoInfo = null;
 document.addEventListener('DOMContentLoaded', async () => {
   log('Popup starting');
 
+  // Clear download-complete badge on icon
+  chrome.action.setBadgeText({ text: '' });
+
+  // Notify background that popup is open (suppress badge during popup session)
+  const popupPort = chrome.runtime.connect({ name: 'popup' });
+
   // Cache storage reference immediately
   storageLocal = chrome.storage?.local;
   log(`Storage available: ${!!storageLocal}`);
 
   // Set up event listeners FIRST
   downloadBtn.addEventListener('click', startDownload);
-  pauseBtn.addEventListener('click', togglePauseDownload);
-  cancelBtn.addEventListener('click', cancelDownload);
+  progressPauseBtn.addEventListener('click', togglePauseDownload);
+  progressCancelBtn.addEventListener('click', cancelDownload);
+  refreshBtn.addEventListener('click', () => {
+    downloadCompleted.style.display = 'none';
+    showDownloadBtn();
+  });
   playBtn.addEventListener('click', playVideo);
   openFolderBtn.addEventListener('click', openFolder);
   retryBtn.addEventListener('click', resetState);
@@ -92,42 +104,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadDownloadedVideos();
   renderDownloadedList();
 
-  // Hide progress bar initially (shown only when downloading)
-  progressSection.style.display = 'none';
-
   // Load cached video info and formats for fast display
   await loadCachedVideoInfo();
   await loadCachedFormats();
 
-  // Check native host connectivity first
-  const nativeOk = await checkNativeHost();
-  if (!nativeOk) {
-    log('Native host not available, showing setup UI');
-    showSetupUI();
-    return;
-  }
-
-  // Restore download state if there's an active/paused/completed download
-  const restored = await restoreDownloadState();
-  if (restored) {
-    log('Restored download state, skipping normal setup');
-    return;
-  }
-
-  // Check if on YouTube video page
+  // Get current tab URL immediately (fast API call)
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   log(`Tab URL: ${tab.url}`);
 
-  // Check if on YouTube video page (watch or shorts)
   const isYouTubeWatch = tab.url && tab.url.includes('youtube.com/watch');
   const isYouTubeShorts = tab.url && tab.url.includes('youtube.com/shorts/');
-  if (!isYouTubeWatch && !isYouTubeShorts) {
-    log('Not a YouTube watch page');
-    showNonVideoError('请在视频播放页打开扩展');
-    return;
-  }
-
-  // Get current video ID from URL (watch?v=X or /shorts/X)
   let currentVideoIdFromUrl = null;
   if (isYouTubeWatch) {
     currentVideoIdFromUrl = new URL(tab.url).searchParams.get('v');
@@ -137,22 +123,70 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   log(`Current video ID from URL: ${currentVideoIdFromUrl}`);
 
-  // Check if we have cached info for this video — show directly, no loading flash
-  if (cachedVideoInfo && cachedVideoInfo.videoId === currentVideoIdFromUrl) {
-    log('Using cached video info for fast display');
+  // === Step 1: Check download state FIRST — must run before anything shows the download button ===
+  // (restoreDownloadState handles its own UI: progress bar, paused state, etc.)
+  const restored = await restoreDownloadState();
+  if (restored) {
+    log('Restored download state, skipping normal setup');
+    // Still check native host in background — formats may be needed after resume
+    checkNativeHost().then(ok => { if (!ok) log('Native host unavailable after restore'); });
+    return;
+  }
+
+  // === Step 2: Show cached info IMMEDIATELY, but ONLY for the current video ===
+  let cachedUsed = false;
+  let formatsAlreadyFetching = false;
+  if (cachedVideoInfo && currentVideoIdFromUrl && cachedVideoInfo.videoId === currentVideoIdFromUrl) {
+    displayVideoInfo(cachedVideoInfo);
     currentVideoInfo = cachedVideoInfo;
-    currentVideoId = currentVideoIdFromUrl;
-    displayVideoInfo(currentVideoInfo);
-    // Directly show video, no loading state
-    showLoadingState(false);
+    currentVideoId = cachedVideoInfo.videoId;
     currentVideo.style.display = 'block';
-    // Notify background that video info is ready (for icon)
+    showLoadingState(false);
     chrome.runtime.sendMessage({ type: 'videoInfoReceived' }).catch(() => {});
-    // Fetch formats in background
-    fetchFormats(currentVideoInfo.url);
-    // Also refresh title/duration from the page (cached data may be stale)
+    // Use per-videoId cache only (from background prefetch) — never stale global cache
+    const keys = Object.keys(formatsByVideoId);
+    log(`formatsByVideoId cache has ${keys.length} entries: [${keys.join(', ')}]`);
+    if (formatsByVideoId[currentVideoIdFromUrl]) {
+      log(`Found cached formats for current video ${currentVideoIdFromUrl}`);
+      populateQualitySelect(formatsByVideoId[currentVideoIdFromUrl].formats);
+    } else {
+      log(`No cached formats for ${currentVideoIdFromUrl}, fetching from native`);
+      formatsAlreadyFetching = true;
+      fetchFormats(currentVideoInfo.url || `https://www.youtube.com/watch?v=${currentVideoIdFromUrl}`, false);
+    }
+    cachedUsed = true;
+  }
+
+  // === Step 3: Check native host (only blocks after cache is shown) ===
+  const nativeOk = await checkNativeHost();
+  if (!nativeOk) {
+    // If we have cached info, keep showing it + show error in quality dropdown
+    if (currentVideoInfo) {
+      qualitySelect.innerHTML = '';
+      addQualityOption('native-unavailable', '下载服务未启动，请检查安装', true);
+      downloadBtn.style.display = 'none';
+      return;
+    }
+    log('Native host not available, showing setup UI');
+    showSetupUI();
+    return;
+  }
+
+  // === Step 4: If cached info was shown, refresh in background and return ===
+  if (cachedUsed) {
+    log('Cached info already shown, refreshing formats and meta in background');
+    if (!formatsAlreadyFetching) {
+      fetchFormats(currentVideoInfo.url);
+    }
     refreshVideoMeta(tab.id, currentVideoIdFromUrl);
     log('Setup complete (cached)');
+    return;
+  }
+
+  // === Step 5: Not YouTube? Show error ===
+  if (!isYouTubeWatch && !isYouTubeShorts) {
+    log('Not a YouTube watch page');
+    showNonVideoError('请在视频播放页打开扩展');
     return;
   }
 
@@ -254,14 +288,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     displayVideoInfo(currentVideoInfo);
 
-    // Keep loading state visible while fetching formats
-    showLoadingState(true);
-    currentVideo.style.display = 'none'; // Hide video section until formats are ready
+    // Show video immediately, don't hide while formats load
+    showLoadingState(false);
+    currentVideo.style.display = 'block';
+    // Update quality select to show loading
+    qualitySelect.innerHTML = '';
+    addQualityOption('loading', '获取画质信息中，请稍等...', true);
 
     // Skip getDownloadState - not needed for fresh fetch
-    // Directly fetch formats
-    log('Calling fetchFormats...');
-    fetchFormats(currentVideoInfo.url);
+    // Directly fetch formats — skip cache since this is a fresh video
+    log('Calling fetchFormats (fresh)...');
+    fetchFormats(currentVideoInfo.url, false);
     log('Setup complete');
   } catch (err) {
     log(`Script execution failed: ${err.message}`);
@@ -285,10 +322,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         };
         currentVideoId = videoId;
         displayVideoInfo(currentVideoInfo);
-        // Show loading while fetching formats
-        showLoadingState(true);
-        currentVideo.style.display = 'none';
-        fetchFormats(tab.url);
+        // Show video immediately, formats load in background
+        showLoadingState(false);
+        currentVideo.style.display = 'block';
+        qualitySelect.innerHTML = '';
+        addQualityOption('loading', '获取画质信息中，请稍等...', true);
+        fetchFormats(tab.url, false);
         log('Using fallback video info');
         return;
       }
@@ -329,6 +368,7 @@ async function loadCachedVideoInfo() {
 
 // Cache formats to storage
 let cachedFormats = null;
+let formatsByVideoId = {};
 function cacheFormats(formats) {
   cachedFormats = formats;
   if (storageLocal) {
@@ -339,12 +379,17 @@ function cacheFormats(formats) {
 // Load cached formats from storage
 async function loadCachedFormats() {
   cachedFormats = null;
+  formatsByVideoId = {};
   if (storageLocal) {
     try {
-      const result = await storageLocal.get(['cachedFormats']);
+      const result = await storageLocal.get(['cachedFormats', 'formatsCacheByVideoId']);
       if (result.cachedFormats) {
         cachedFormats = result.cachedFormats;
         log('Loaded cached formats: ' + cachedFormats.length);
+      }
+      if (result.formatsCacheByVideoId) {
+        formatsByVideoId = result.formatsCacheByVideoId;
+        log('Loaded per-videoId format cache with ' + Object.keys(formatsByVideoId).length + ' entries');
       }
     } catch (e) {
       log('Failed to load cached formats: ' + e.message);
@@ -431,6 +476,9 @@ function addDownloadedVideo(videoInfo) {
   // Keep only last 20
   downloadedVideos = downloadedVideos.slice(0, 20);
 
+  // Mark this item for green border highlight
+  window._justDownloadedPath = videoInfo.filePath;
+
   // Always render the list immediately
   renderDownloadedList();
 
@@ -465,27 +513,33 @@ function renderDownloadedList() {
   const displayVideos = showAll ? downloadedVideos : downloadedVideos.slice(0, 3);
 
   downloadedList.innerHTML = displayVideos.map(video => {
+    const formatLabel = buildFormatLabel(video);
     const meta = video.qualityMeta;
     const ext = meta?.ext || (video.filePath ? video.filePath.split('.').pop().toUpperCase() : '');
     const sizeStr = formatSize(video.filesize);
+    const highlightClass = video.filePath === window._justDownloadedPath ? ' just-downloaded' : '';
     return `
-    <div class="downloaded-item" data-video-id="${escapeAttr(video.videoId)}" data-path="${escapeAttr(video.filePath)}">
+    <div class="downloaded-item${highlightClass}" data-video-id="${escapeAttr(video.videoId)}" data-path="${escapeAttr(video.filePath)}">
       <img class="thumbnail" src="${escapeAttr(video.thumbnail)}" alt="thumbnail">
       <div class="info">
-        <div class="title">${escapeHtml(video.title)}${ext ? ' · ' + ext : ''}</div>
-        <div class="meta">${sizeStr || (video.filePath ? video.filePath.split('/').pop() : '')}</div>
+        <div class="title">${escapeHtml(video.title)}</div>
+        <div class="format-info">${escapeHtml(formatLabel)}</div>
       </div>
       <div class="actions">
-        <button class="mini-btn play" data-path="${escapeAttr(video.filePath)}">播放</button>
-        <button class="mini-btn folder" data-path="${escapeAttr(video.filePath)}">文件夹</button>
+        <button class="mini-btn folder" data-path="${escapeAttr(video.filePath)}" title="打开文件夹">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+        </button>
+        <button class="mini-btn delete" data-path="${escapeAttr(video.filePath)}" title="删除记录">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
       </div>
     </div>
   `;}).join('');
 
-  // "Show more" / "Collapse" button
-  if (downloadedVideos.length > 3) {
+  // "查看全部" button — always shows same text, hides after expansion
+  if (downloadedVideos.length > 3 && !downloadedListExpanded) {
     showMoreWrap.style.display = 'flex';
-    showMoreBtn.textContent = showAll ? '收起' : `查看更多 (${downloadedVideos.length - 3})`;
+    showMoreBtn.textContent = '查看全部';
   } else {
     showMoreWrap.style.display = 'none';
   }
@@ -497,17 +551,18 @@ function renderDownloadedList() {
     });
   });
 
-  // Add event listeners — mini buttons (stop propagation to avoid double-trigger)
-  downloadedList.querySelectorAll('.mini-btn.play').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      playDownloaded(btn.dataset.path);
-    });
-  });
+  // Add event listeners — folder button (stop propagation to avoid double-trigger)
   downloadedList.querySelectorAll('.mini-btn.folder').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       openDownloadedFolder(btn.dataset.path);
+    });
+  });
+  // Add event listeners — delete button
+  downloadedList.querySelectorAll('.mini-btn.delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteDownloadedVideo(btn.dataset.path);
     });
   });
 }
@@ -522,6 +577,23 @@ function qualityToLabel(quality) {
   const num = parseInt(quality);
   if (num > 0) return quality;
   return quality.replace(/p$/i, 'P');
+}
+
+// Build format label for downloaded video (e.g., "720P MP4 25MB")
+function buildFormatLabel(video) {
+  const meta = video.qualityMeta;
+  if (meta && meta.height) {
+    const h = meta.height === 2160 ? '4K' : meta.height + 'P';
+    const parts = [h];
+    if (meta.ext) parts.push(meta.ext);
+    const sizeStr = formatSize(video.filesize || meta.filesize);
+    if (sizeStr) parts.push(sizeStr);
+    return parts.join(' ');
+  }
+  // Fallback: use file extension from path
+  const ext = video.filePath ? video.filePath.split('.').pop().toUpperCase() : '';
+  const sizeStr = formatSize(video.filesize);
+  return [ext, sizeStr].filter(Boolean).join(' ');
 }
 
 // Escape HTML entities
@@ -564,15 +636,31 @@ function openDownloadedFolder(filePath) {
   }
 }
 
+// Delete a downloaded video record
+function deleteDownloadedVideo(filePath) {
+  log('deleteDownloadedVideo called, filePath: ' + filePath);
+  downloadedVideos = downloadedVideos.filter(v => v.filePath !== filePath);
+  saveDownloadedVideos();
+  renderDownloadedList();
+}
+
 // Fetch available formats from native host
 function fetchFormats(url, useCached = true) {
   log(`fetchFormats called with URL: ${url}, useCached=${useCached}`);
 
-  // Check if we have cached formats for this URL
-  if (useCached && cachedFormats) {
-    log('Using cached formats');
-    populateQualitySelect(cachedFormats);
+  // Check per-videoId cache first (filled by background prefetch or previous load)
+  if (useCached && currentVideoId && formatsByVideoId[currentVideoId]) {
+    log(`Using per-videoId cached formats for ${currentVideoId}`);
+    populateQualitySelect(formatsByVideoId[currentVideoId].formats);
     // Still fetch in background to update cache
+    fetchFormatsFromNative(url);
+    return;
+  }
+
+  // Fall back to global cache
+  if (useCached && cachedFormats) {
+    log('Using global cached formats');
+    populateQualitySelect(cachedFormats);
     fetchFormatsFromNative(url);
     return;
   }
@@ -619,11 +707,9 @@ function fetchFormatsFromNative(url) {
       log('Port disconnected');
       clearTimeout(timeoutId);
       if (!timedOut) {
-        // Only show fallback if we haven't already shown it
+        // Only fallback to cached formats — never clear the select
         if (cachedFormats) {
           populateQualitySelect(cachedFormats);
-        } else {
-          populateQualitySelect([]);
         }
       }
     });
@@ -648,6 +734,9 @@ function populateQualitySelect(formats) {
 
   showLoadingState(false);
   currentVideo.style.display = 'block';
+
+  // Notify background that formats are ready → icon green
+  chrome.runtime.sendMessage({ type: 'formatsReady' }).catch(() => {});
 
   if (!formats || formats.length === 0) {
     addQualityOption('best', '最高画质', true);
@@ -704,13 +793,21 @@ function populateQualitySelect(formats) {
   const defaultMp4 = videoFmts.find(f => (f.ext || '').toLowerCase() === 'mp4');
   if (defaultMp4) defaultMp4._default = true;
 
-  // Build label for a video format
+  // Find best audio size to add to video-only formats (since download merges video+audio)
+  let bestAudioSize = 0;
+  if (audioFmts.length > 0) {
+    const bestAudio = audioFmts.reduce((best, f) => (f.filesize || 0) > (best.filesize || 0) ? f : best, audioFmts[0]);
+    bestAudioSize = bestAudio.filesize || 0;
+  }
+
+  // Build label for a video format (add audio size since download merges video+audio)
   const buildVideoLabel = (fmt) => {
     const h = heightLabel(fmt.height);
     const parts = [h];
     if (fmt.codec) parts.push(fmt.codec);
     parts.push((fmt.ext || '').toUpperCase());
-    const sizeStr = formatSize(fmt.filesize);
+    const combinedSize = (fmt.filesize || 0) + bestAudioSize;
+    const sizeStr = formatSize(combinedSize);
     if (sizeStr) parts.push(sizeStr);
     return parts.join(' ');
   };
@@ -758,6 +855,28 @@ function populateQualitySelect(formats) {
   }
 
   log(`Quality select populated with ${qualitySelect.options.length} options`);
+
+  // Set button ready state
+  downloadBtn.disabled = false;
+  btnText.textContent = '下载';
+  completionSection.style.display = 'none';
+  errorSection.style.display = 'none';
+
+  // Show download button only if no active progress/completed state
+  // (restoreDownloadState shows thickProgress/downloadCompleted; don't overwrite)
+  if (thickProgress.style.display !== 'block' && downloadCompleted.style.display !== 'flex') {
+    showDownloadBtn();
+  }
+
+  // Sync formats to per-videoId cache so background can keep icon green
+  if (currentVideoId && storageLocal && formats.length > 0) {
+    storageLocal.get(['formatsCacheByVideoId'], (result) => {
+      const cache = result.formatsCacheByVideoId || {};
+      cache[currentVideoId] = { formats, timestamp: Date.now() };
+      storageLocal.set({ formatsCacheByVideoId: cache });
+      log(`Synced formats to formatsCacheByVideoId for ${currentVideoId}`);
+    });
+  }
 }
 
 // Add option to quality select
@@ -921,8 +1040,9 @@ function togglePauseDownload() {
   if (downloadPaused) {
     // Resume
     downloadPaused = false;
-    pauseBtnText.textContent = '暂停';
-    pauseBtn.className = 'download-action-btn pause-btn';
+    thickProgress.classList.remove('paused');
+    progressPauseBtn.title = '暂停';
+    progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
     chrome.runtime.sendMessage({
       type: 'startDownload',
       url: currentVideoInfo.url,
@@ -936,8 +1056,10 @@ function togglePauseDownload() {
   } else {
     // Pause: tell background to pause
     downloadPaused = true;
-    pauseBtnText.textContent = '继续';
-    pauseBtn.className = 'download-action-btn resume-btn';
+    thickProgress.classList.add('paused');
+    thickProgressLabel.textContent = '已暂停';
+    progressPauseBtn.title = '继续下载';
+    progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
     chrome.runtime.sendMessage({ type: 'pauseDownload' }).catch(() => {});
   }
 }
@@ -955,18 +1077,28 @@ function cancelDownload() {
   resetState();
 }
 
-// Show download button (hide pause/cancel)
+// Show download button (hide thick progress bar and completed state)
 function showDownloadBtn() {
   downloadBtn.style.display = 'block';
-  downloadActions.style.display = 'none';
+  thickProgress.style.display = 'none';
+  downloadCompleted.style.display = 'none';
 }
 
-// Show pause/cancel buttons (hide download)
-function showDownloadActions() {
+// Show completed state after download finishes
+function showDownloadCompleted() {
   downloadBtn.style.display = 'none';
-  downloadActions.style.display = 'flex';
-  pauseBtnText.textContent = '暂停';
-  pauseBtn.className = 'download-action-btn pause-btn';
+  thickProgress.style.display = 'none';
+  downloadCompleted.style.display = 'flex';
+}
+
+// Show thick progress bar (hide download button)
+function showThickProgress() {
+  downloadBtn.style.display = 'none';
+  thickProgress.style.display = 'block';
+  thickProgress.classList.remove('paused');
+  // Reset pause icon to pause (two bars)
+  progressPauseBtn.title = '暂停';
+  progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
 }
 
 // Watch downloadState changes in storage (for real-time progress)
@@ -983,18 +1115,20 @@ function watchDownloadState() {
     switch (state.status) {
       case 'downloading':
         if (!downloadPaused) {
+          thickProgress.classList.remove('paused');
+          progressPauseBtn.title = '暂停';
           updateProgress(state.progress, state.statusText);
-          showDownloadActions();
-          progressSection.style.display = 'block';
+          showThickProgress();
         }
         break;
       case 'paused':
+        thickProgress.classList.add('paused');
+        showThickProgress();
         updateProgress(state.progress, '下载已暂停');
-        showDownloadActions();
-        pauseBtnText.textContent = '继续';
-        pauseBtn.className = 'download-action-btn resume-btn';
+        thickProgressLabel.textContent = '已暂停';
+        progressPauseBtn.title = '继续下载';
+        progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
         downloadPaused = true;
-        progressSection.style.display = 'block';
         break;
       case 'complete':
         downloadComplete = true;
@@ -1002,10 +1136,9 @@ function watchDownloadState() {
           chrome.storage.onChanged.removeListener(storageChangeListener);
           storageChangeListener = null;
         }
-        showDownloadBtn();
-        progressBar.style.width = '0%';
-        statusText.textContent = '';
-        progressSection.style.display = 'none';
+        showDownloadCompleted();
+        thickProgressFill.style.width = '0%';
+        thickProgressLabel.textContent = '正在下载';
         // Add to downloaded list
         addDownloadedVideo({
           videoId: currentVideoId,
@@ -1073,11 +1206,11 @@ async function restoreDownloadState() {
       switch (state.status) {
         case 'downloading':
           displayVideoInfo(currentVideoInfo);
-          showDownloadActions();
+          showThickProgress();
+          thickProgress.classList.remove('paused');
+          progressPauseBtn.title = '暂停';
           downloadPaused = false;
-          progressSection.style.display = 'block';
           updateProgress(state.progress, state.statusText || '下载中...');
-          downloadBtn.style.display = 'none';
           watchDownloadState();
           // Also fetch formats in background for when download completes
           pendingQualityRestore = state.quality || null;
@@ -1088,13 +1221,13 @@ async function restoreDownloadState() {
 
         case 'paused':
           displayVideoInfo(currentVideoInfo);
-          showDownloadActions();
+          showThickProgress();
+          thickProgress.classList.add('paused');
           downloadPaused = true;
-          progressSection.style.display = 'block';
           updateProgress(state.progress, '下载已暂停');
-          pauseBtnText.textContent = '继续';
-          pauseBtn.className = 'download-action-btn resume-btn';
-          downloadBtn.style.display = 'none';
+          thickProgressLabel.textContent = '已暂停';
+          progressPauseBtn.title = '继续下载';
+          progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
           watchDownloadState();
           pendingQualityRestore = state.quality || null;
           if (currentVideoInfo.url) {
@@ -1104,9 +1237,17 @@ async function restoreDownloadState() {
 
         case 'complete':
           // Add to downloaded list (don't show old completion section)
+          displayVideoInfo(currentVideoInfo);
           downloadComplete = true;
-          showDownloadBtn();
-          progressSection.style.display = 'none';
+          showDownloadCompleted();
+          // Populate quality select from cache (needed for "重新下载" button)
+          if (formatsByVideoId[currentVideoId] && formatsByVideoId[currentVideoId].formats) {
+            log(`Complete case: loading formats from cache for ${currentVideoId}`);
+            populateQualitySelect(formatsByVideoId[currentVideoId].formats);
+          } else if (currentVideoInfo.url) {
+            log('Complete case: fetching formats from native');
+            fetchFormats(currentVideoInfo.url);
+          }
           if (state.filePath) {
             // Add to downloaded list
             addDownloadedVideo({
@@ -1175,8 +1316,12 @@ async function tryUpdateYtDlp() {
 
 // Update progress display
 function updateProgress(percent, status) {
-  progressBar.style.width = `${percent}%`;
-  statusText.textContent = status || `下载中... ${percent.toFixed(1)}%`;
+  thickProgressFill.style.width = `${percent}%`;
+  if (percent <= 0) {
+    thickProgressLabel.textContent = '正在下载';
+  } else {
+    thickProgressLabel.textContent = `${percent.toFixed(1)}%`;
+  }
 }
 
 // Show completion state (keep video section visible)
@@ -1213,18 +1358,17 @@ function showNonVideoError(message) {
   durationBadge.style.display = 'none';
   qualitySelect.parentElement.style.display = 'none';
   downloadBtn.style.display = 'none';
-  downloadActions.style.display = 'none';
-  progressSection.style.display = 'none';
+  thickProgress.style.display = 'none';
+  downloadCompleted.style.display = 'none';
   completionSection.style.display = 'none';
   errorSection.style.display = 'none';
 }
 
 // Set downloading state
 function setDownloadingState() {
-  showDownloadActions();
-  progressSection.style.display = 'block';
-  progressBar.style.width = '0%';
-  statusText.textContent = '正在解析视频信息...';
+  showThickProgress();
+  thickProgressFill.style.width = '0%';
+  thickProgressLabel.textContent = '正在下载';
   completionSection.style.display = 'none';
   errorSection.style.display = 'none';
 }
@@ -1234,9 +1378,8 @@ function resetState() {
   downloadBtn.disabled = false;
   btnText.textContent = '下载';
   showDownloadBtn();
-  progressSection.style.display = 'block';
-  progressBar.style.width = '0%';
-  statusText.textContent = '';
+  thickProgressFill.style.width = '0%';
+  thickProgressLabel.textContent = '0%';
   errorSection.style.display = 'none';
   downloadComplete = false;
   currentVideo.style.display = 'block';
@@ -1248,9 +1391,8 @@ function setDownloadReadyState() {
   downloadBtn.disabled = false;
   btnText.textContent = '下载';
   showDownloadBtn();
-  progressSection.style.display = 'block';
-  progressBar.style.width = '0%';
-  statusText.textContent = '';
+  thickProgressFill.style.width = '0%';
+  thickProgressLabel.textContent = '0%';
   completionSection.style.display = 'none';
   errorSection.style.display = 'none';
 }
@@ -1299,7 +1441,7 @@ function checkNativeHost() {
         log('checkNativeHost: timeout');
         resolve(false);
       }
-    }, 2000);
+    }, 5000);
 
     try {
       const port = chrome.runtime.connectNative('com.stardownload.host');
@@ -1721,24 +1863,18 @@ function setupEventListeners() {
     moreMenuDropdown.style.display = 'none';
   });
 
-  // "Show more" / "Collapse" button
+  // "Show more" button — always expand, never collapse
   showMoreBtn.addEventListener('click', () => {
-    downloadedListExpanded = !downloadedListExpanded;
+    downloadedListExpanded = true;
     renderDownloadedList();
-    // Collapse video info section when expanding the downloaded list
-    if (downloadedListExpanded && downloadedVideos.length > 3) {
-      const videoHeight = currentVideo.offsetHeight;
-      currentVideo.style.display = 'none';
-      downloadBtn.style.display = 'none';
-      downloadActions.style.display = 'none';
-      progressSection.style.display = 'none';
-      completionSection.style.display = 'none';
-      errorSection.style.display = 'none';
-      downloadedList.style.maxHeight = (260 + videoHeight) + 'px';
-    } else {
-      currentVideo.style.display = 'block';
-      downloadedList.style.maxHeight = '260px';
-    }
+    // Hide video section and download controls when expanding
+    currentVideo.style.display = 'none';
+    downloadBtn.style.display = 'none';
+    thickProgress.style.display = 'none';
+    downloadCompleted.style.display = 'none';
+    completionSection.style.display = 'none';
+    errorSection.style.display = 'none';
+    downloadedList.style.maxHeight = '400px';
   });
 
   // Close dropdown on click outside

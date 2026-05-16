@@ -19,6 +19,89 @@ let downloadComplete = false;
 let pausedProgress = 0;
 let lastDownloadRequest = null;
 
+// Track whether popup is currently open (for badge suppression)
+let popupOpen = false;
+
+// Background format prefetch
+let formatFetchTimer = null;
+let activePrefetchVideoId = null;
+
+// Cancel any pending format prefetch
+function cancelFormatPrefetch() {
+  if (formatFetchTimer) {
+    clearTimeout(formatFetchTimer);
+    formatFetchTimer = null;
+  }
+  activePrefetchVideoId = null;
+}
+
+// Start 3-second timer before fetching formats in background
+function scheduleFormatPrefetch(tabId, url, videoId) {
+  cancelFormatPrefetch();
+  log(`Scheduling format prefetch for ${videoId} in 3s`);
+  activePrefetchVideoId = videoId;
+  formatFetchTimer = setTimeout(() => {
+    formatFetchTimer = null;
+    // Only fetch if still on the same video
+    if (activePrefetchVideoId === videoId) {
+      doBackgroundFormatFetch(url, videoId);
+    }
+  }, 3000);
+}
+
+// Actually fetch formats in background via native host
+function doBackgroundFormatFetch(url, videoId) {
+  log(`doBackgroundFormatFetch for video: ${videoId}`);
+  try {
+    const port = chrome.runtime.connectNative('com.stardownload.host');
+    let resolved = false;
+
+    port.onMessage.addListener((response) => {
+      if (resolved) return;
+      if (response.type === 'formats') {
+        resolved = true;
+        log(`Background fetched ${response.formats.length} formats for ${videoId}`);
+        cacheFormatsByVideoId(videoId, response.formats);
+        // If still watching this video, turn icon green
+        if (activePrefetchVideoId === videoId) {
+          updateIcon(true, true);
+          cancelFormatPrefetch();
+        }
+        port.disconnect();
+      } else if (response.type === 'error') {
+        resolved = true;
+        log(`Background format fetch error: ${response.message}`);
+        port.disconnect();
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (!resolved) {
+        log('Background format fetch port disconnected');
+      }
+    });
+
+    port.postMessage({ action: 'listFormats', url });
+  } catch (err) {
+    log(`doBackgroundFormatFetch error: ${err.message}`);
+  }
+}
+
+// Cache formats by videoId in storage
+function cacheFormatsByVideoId(videoId, formats) {
+  chrome.storage.local.get(['formatsCacheByVideoId'], (result) => {
+    const cache = result.formatsCacheByVideoId || {};
+    cache[videoId] = { formats, timestamp: Date.now() };
+    // Keep only last 20 entries
+    const keys = Object.keys(cache);
+    if (keys.length > 20) {
+      keys.sort((a, b) => cache[b].timestamp - cache[a].timestamp);
+      keys.slice(20).forEach(k => delete cache[k]);
+    }
+    chrome.storage.local.set({ formatsCacheByVideoId: cache });
+  });
+}
+
 // Update download state
 function updateDownloadState(state) {
   downloadState = { ...downloadState, ...state };
@@ -63,6 +146,7 @@ function initAllTabsGray() {
 
 // Listen for tab updates to check YouTube video status
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  cancelFormatPrefetch();
   if (changeInfo.status === 'complete' && tab.url) {
     checkYouTubeVideoStatus(tabId, tab.url);
   }
@@ -70,6 +154,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 // Listen for tab activation changes
 chrome.tabs.onActivated.addListener((activeInfo) => {
+  cancelFormatPrefetch();
   chrome.tabs.get(activeInfo.tabId, (tab) => {
     if (tab) {
       if (tab.url) {
@@ -85,32 +170,40 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 function checkYouTubeVideoStatus(tabId, url) {
   if (!url || (!url.includes('youtube.com/watch') && !url.includes('youtube.com/shorts/'))) {
     updateIcon(false, false);
+    cancelFormatPrefetch();
     return;
   }
 
-  updateIcon(true, false);
+  // Extract videoId from URL
+  let videoId = null;
+  if (url.includes('youtube.com/shorts/')) {
+    const match = url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
+    if (match) videoId = match[1];
+  } else {
+    try {
+      videoId = new URL(url).searchParams.get('v');
+    } catch (e) {}
+  }
 
-  try {
-    chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        let videoId = null;
-        if (location.href.includes('/shorts/')) {
-          const match = location.href.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
-          if (match) videoId = match[1];
-        } else {
-          videoId = new URL(location.href).searchParams.get('v');
-        }
-        const videoEl = document.querySelector('video');
-        return !!(videoId && videoEl && videoEl.duration);
-      },
-      world: 'MAIN'
-    }).then((results) => {
-      if (results && results[0] && results[0].result) {
-        updateIcon(true, true);
-      }
-    }).catch(() => {});
-  } catch (e) {}
+  if (!videoId) {
+    updateIcon(true, false);
+    return;
+  }
+
+  // Check if formats are already cached for this video
+  chrome.storage.local.get(['formatsCacheByVideoId'], (result) => {
+    const cache = result.formatsCacheByVideoId || {};
+    if (cache[videoId]) {
+      // Formats already cached, icon green immediately
+      log(`Formats already cached for ${videoId}, icon green`);
+      updateIcon(true, true);
+    } else {
+      // Formats not cached, stay gray, schedule prefetch
+      log(`Formats not cached for ${videoId}, icon gray, scheduling prefetch`);
+      updateIcon(true, false);
+      scheduleFormatPrefetch(tabId, url, videoId);
+    }
+  });
 }
 
 // === Download Management (Native Port in Background) ===
@@ -124,7 +217,8 @@ function doStartDownload(request) {
     url: request.url,
     title: request.title,
     quality: request.quality,
-    qualityMeta: request.qualityMeta
+    qualityMeta: request.qualityMeta,
+    isResume: request.isResume || false
   };
 
   if (request.isResume) {
@@ -198,6 +292,13 @@ function handleDownloadMessage(message) {
       downloadComplete = true;
       pausedProgress = 0;
       downloadPort = null;
+      // Show light blue badge on icon only when popup is closed
+      // (if popup is open, user already sees the download completion in the UI)
+      if (!popupOpen) {
+        chrome.action.setBadgeText({ text: '✓' });
+        chrome.action.setBadgeBackgroundColor({ color: '#4FC3F7' });
+        chrome.action.setBadgeTextColor({ color: '#FFFFFF' });
+      }
       // Preserve qualityMeta/quality/videoTitle from the start state
       updateDownloadState({
         status: 'complete',
@@ -259,6 +360,12 @@ function log(msg) {
 // Handle messages from popup and content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'videoInfoReceived') {
+    // Video info is available — icon can go green
+    updateIcon(true, true);
+    sendResponse({ success: true });
+  } else if (request.type === 'formatsReady') {
+    log('formatsReady from popup — icon green');
+    // Icon green now; background prefetch is unaffected and will complete on its own
     updateIcon(true, true);
     sendResponse({ success: true });
   } else if (request.type === 'startDownload') {
@@ -309,6 +416,18 @@ chrome.runtime.onInstalled.addListener((details) => {
   console.log('StarDownload: Extension installed/updated');
 });
 
+// Track popup open/close via port connection (for badge suppression)
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === 'popup') {
+    popupOpen = true;
+    log('Popup opened');
+    port.onDisconnect.addListener(() => {
+      popupOpen = false;
+      log('Popup closed');
+    });
+  }
+});
+
 // Initialize state from storage on startup
 chrome.storage.local.get(['downloadState', 'downloadedVideos'], (result) => {
   if (result.downloadState) {
@@ -337,6 +456,18 @@ chrome.storage.local.get(['downloadState', 'downloadedVideos'], (result) => {
 
 // Set all icons to gray immediately, then check YouTube tabs
 initAllTabsGray();
+
+// Listen for storage changes: when popup stores formats, update icon immediately
+chrome.storage.onChanged.addListener((changes, namespace) => {
+  if (namespace !== 'local' || !changes.formatsCacheByVideoId) return;
+  // Popup wrote formats — check if current tab icon should turn green
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs[0];
+    if (tab && tab.url) {
+      checkYouTubeVideoStatus(tab.id, tab.url);
+    }
+  });
+});
 
 // Check yt-dlp version by querying native host
 function checkYtDlpVersion() {

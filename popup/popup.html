@@ -52,26 +52,32 @@
           </select>
         </div>
 
-        <button id="downloadBtn" class="download-btn">
-          <span id="btnText">下载</span>
-        </button>
-
-        <!-- Pause/Cancel actions (shown during download) -->
-        <div class="download-actions" id="downloadActions" style="display: none;">
-          <button id="pauseBtn" class="download-action-btn pause-btn">
-            <span id="pauseBtnText">暂停</span>
+        <!-- Unified download bar area -->
+        <div class="download-bar-area" id="downloadBarArea">
+          <button id="downloadBtn" class="download-btn" style="display: none;">
+            <span id="btnText">下载</span>
           </button>
-          <button id="cancelBtn" class="download-action-btn cancel-btn">取消</button>
+
+          <div class="thick-progress" id="thickProgress" style="display: none;">
+            <div class="thick-progress-fill" id="thickProgressFill"></div>
+            <div class="thick-progress-label" id="thickProgressLabel">0%</div>
+            <div class="thick-progress-controls" id="thickProgressControls">
+              <button class="progress-icon-btn" id="progressPauseBtn" title="暂停">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+              </button>
+              <button class="progress-icon-btn" id="progressCancelBtn" title="取消下载">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="download-completed" id="downloadCompleted" style="display: none;">
+            <button class="re-download-btn" id="refreshBtn">重新下载</button>
+          </div>
         </div>
       </div>
 
-      <!-- Progress Section -->
-      <div class="progress-section" id="progressSection">
-        <div class="progress-bar-container">
-          <div class="progress-bar" id="progressBar"></div>
-        </div>
-        <div class="status-text" id="statusText"></div>
-      </div>
+      <div class="status-text" id="statusText"></div>
 
       <!-- Completion Section -->
       <div class="completion-section" id="completionSection" style="display: none;">
