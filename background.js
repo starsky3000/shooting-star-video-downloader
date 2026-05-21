@@ -1,5 +1,15 @@
 // StarDownload Background Service Worker
 
+// Import i18n module
+importScripts('popup/i18n.js');
+
+// Initialize i18n
+I18n.init().then(() => {
+  log(`i18n ready: ${I18n.getLang()}`);
+}).catch(e => {
+  log(`i18n init failed: ${e.message}`);
+});
+
 // Download state management
 let downloadState = {
   status: 'idle', // idle, downloading, paused, complete, error
@@ -242,7 +252,7 @@ function doStartDownload(request) {
       if (!downloadComplete && downloadState.status === 'downloading') {
         updateDownloadState({
           status: 'error',
-          errorMessage: '连接中断，请重试'
+          errorMessage: I18n.t('error_disconnected')
         });
       }
     });
@@ -253,7 +263,7 @@ function doStartDownload(request) {
     updateDownloadState({
       status: 'downloading',
       progress: pausedProgress,
-      statusText: pausedProgress > 0 ? '继续下载...' : '正在解析视频信息...',
+      statusText: pausedProgress > 0 ? I18n.t('status_resuming') : I18n.t('status_parsing'),
       videoId: request.videoId || null,
       videoTitle: request.title || null,
       qualityMeta: request.qualityMeta || null,
@@ -264,7 +274,7 @@ function doStartDownload(request) {
     log(`doStartDownload error: ${err.message}`);
     updateDownloadState({
       status: 'error',
-      errorMessage: '无法启动下载：' + err.message
+      errorMessage: I18n.t('error_cannot_start') + err.message
     });
   }
 }
@@ -305,7 +315,7 @@ function handleDownloadMessage(message) {
       updateDownloadState({
         status: 'complete',
         progress: 100,
-        statusText: '下载完成！',
+        statusText: I18n.t('status_download_complete'),
         filePath: message.filePath,
         filesize: message.filesize || 0
       });
@@ -333,7 +343,7 @@ function doPauseDownload() {
   updateDownloadState({
     status: 'paused',
     progress: pausedProgress,
-    statusText: '下载已暂停'
+    statusText: I18n.t('status_paused')
   });
 }
 
@@ -375,6 +385,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
   } else if (request.type === 'pauseDownload') {
     doPauseDownload();
+    sendResponse({ success: true });
+  } else if (request.type === 'languageChanged') {
+    I18n.setLang(request.lang).then(() => {
+      log(`Background language changed to: ${request.lang}`);
+      // Re-send current download state to update popup text
+      if (downloadState.status && downloadState.status !== 'idle') {
+        // Update status text in current language
+        updateDownloadState({ statusText: downloadState.statusText });
+      }
+    }).catch(e => {
+      log(`Background language change failed: ${e.message}`);
+    });
     sendResponse({ success: true });
   } else if (request.type === 'cancelDownload') {
     doCancelDownload();
@@ -444,14 +466,14 @@ chrome.storage.local.get(['downloadState', 'downloadedVideos'], (result) => {
     log('Service worker restarted with active download state - resetting');
     updateDownloadState({
       status: 'error',
-      errorMessage: '浏览器已重启，请重新下载'
+      errorMessage: I18n.t('error_restarted')
     });
   }
   if (downloadState.status === 'paused') {
     log('Service worker restarted with paused state - resetting');
     updateDownloadState({
       status: 'error',
-      errorMessage: '浏览器已重启，请重新下载'
+      errorMessage: I18n.t('error_restarted')
     });
   }
 });

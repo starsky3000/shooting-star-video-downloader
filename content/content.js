@@ -1,5 +1,10 @@
 // StarDownload Content Script - Runs on YouTube pages
 
+// Initialize i18n
+if (typeof I18n !== 'undefined') {
+  I18n.init().catch(() => {});
+}
+
 // Proactively report video availability to background for icon update
 function reportVideoStatus() {
   const isVideoPage = window.location.href.includes('/watch?v=');
@@ -76,7 +81,7 @@ function getVideoTitle() {
   // Clean it: remove "- YouTube" suffix and unread count like "(2)" at the START
   let title = document.title.replace(/ - YouTube$/, '').trim();
   title = title.replace(/^\s*\(\d+\)\s*/, '').trim();
-  return title || '未知标题';
+  return title || (typeof I18n !== 'undefined' ? I18n.t('video_unknown_title') : 'Unknown Title');
 }
 
 // Get the smaller thumbnail (default size)

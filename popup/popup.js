@@ -65,9 +65,108 @@ const showMoreWrap = document.getElementById('showMoreWrap');
 // Cached video info
 let cachedVideoInfo = null;
 
+// ---- i18n helper ----
+
+function translatePage() {
+  // Translate elements with data-i18n
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    const text = I18n.t(key);
+    if (text !== key) {
+      el.textContent = text;
+    }
+  });
+  // Translate elements with data-i18n-title
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const key = el.getAttribute('data-i18n-title');
+    const text = I18n.t(key);
+    if (text !== key) {
+      el.title = text;
+    }
+  });
+  // Translate elements with data-i18n-placeholder
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const key = el.getAttribute('data-i18n-placeholder');
+    const text = I18n.t(key);
+    if (text !== key) {
+      el.placeholder = text;
+    }
+  });
+  // Update language select
+  const langSelect = document.getElementById('languageSelect');
+  if (langSelect) {
+    langSelect.value = I18n.getLang();
+  }
+}
+
+// ---- Settings navigation ----
+
+function setupSettingsNavigation() {
+  const settingsBtn = document.getElementById('settingsBtn');
+  const settingsBackBtn = document.getElementById('settingsBackBtn');
+  const settingsPanel = document.getElementById('settingsPanel');
+  const mainContent = document.getElementById('mainContent');
+  const settingsVersion = document.getElementById('settingsVersion');
+  const languageSelect = document.getElementById('languageSelect');
+
+  // Open settings
+  settingsBtn.addEventListener('click', () => {
+    const version = chrome.runtime.getManifest().version;
+    settingsVersion.textContent = 'v' + version;
+    mainContent.style.display = 'none';
+    settingsPanel.style.display = 'flex';
+    languageSelect.value = I18n.getLang();
+  });
+
+  // Close settings (back button)
+  settingsBackBtn.addEventListener('click', () => {
+    settingsPanel.style.display = 'none';
+    mainContent.style.display = 'block';
+  });
+
+  // Language switch
+  languageSelect.addEventListener('change', async () => {
+    const newLang = languageSelect.value;
+    await I18n.setLang(newLang);
+    translatePage();
+    // Re-render dynamic content
+    renderDownloadedList();
+    // If quality select has options loaded, re-translate them
+    if (qualitySelect.options.length > 0 && qualitySelect.value !== 'loading') {
+      if (cachedFormats && cachedFormats.length > 0) {
+        populateQualitySelect(cachedFormats);
+      }
+    }
+    // Update setup UI if visible
+    if (setupSection.style.display === 'flex') {
+      updateSetupUI();
+    }
+    // Notify background of language change
+    chrome.runtime.sendMessage({ type: 'languageChanged', lang: newLang }).catch(() => {});
+  });
+}
+
 // Initialize popup
 document.addEventListener('DOMContentLoaded', async () => {
   log('Popup starting');
+
+  // Initialize i18n first
+  try {
+    await I18n.init();
+    translatePage();
+    log(`i18n ready: ${I18n.getLang()}`);
+  } catch (e) {
+    log(`i18n init failed: ${e.message}`);
+  }
+
+  // Set up settings navigation
+  setupSettingsNavigation();
+
+  // Set version display
+  const settingsVersion = document.getElementById('settingsVersion');
+  if (settingsVersion) {
+    settingsVersion.textContent = 'v' + chrome.runtime.getManifest().version;
+  }
 
   // Clear download-complete badge on icon
   chrome.action.setBadgeText({ text: '' });
@@ -123,12 +222,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   log(`Current video ID from URL: ${currentVideoIdFromUrl}`);
 
-  // === Step 1: Check download state FIRST — must run before anything shows the download button ===
-  // (restoreDownloadState handles its own UI: progress bar, paused state, etc.)
+  // === Step 1: Check download state FIRST ===
   const restored = await restoreDownloadState();
   if (restored) {
     log('Restored download state, skipping normal setup');
-    // Still check native host in background — formats may be needed after resume
     checkNativeHost().then(ok => { if (!ok) log('Native host unavailable after restore'); });
     return;
   }
@@ -143,7 +240,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     currentVideo.style.display = 'block';
     showLoadingState(false);
     chrome.runtime.sendMessage({ type: 'videoInfoReceived' }).catch(() => {});
-    // Use per-videoId cache only (from background prefetch) — never stale global cache
     const keys = Object.keys(formatsByVideoId);
     log(`formatsByVideoId cache has ${keys.length} entries: [${keys.join(', ')}]`);
     if (formatsByVideoId[currentVideoIdFromUrl]) {
@@ -160,10 +256,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // === Step 3: Check native host (only blocks after cache is shown) ===
   const nativeOk = await checkNativeHost();
   if (!nativeOk) {
-    // If we have cached info, keep showing it + show error in quality dropdown
     if (currentVideoInfo) {
       qualitySelect.innerHTML = '';
-      addQualityOption('native-unavailable', '下载服务未启动，请检查安装', true);
+      addQualityOption('native-unavailable', I18n.t('error_native_unavailable'), true);
       downloadBtn.style.display = 'none';
       return;
     }
@@ -186,7 +281,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // === Step 5: Not YouTube? Show error ===
   if (!isYouTubeWatch && !isYouTubeShorts) {
     log('Not a YouTube watch page');
-    showNonVideoError('请在视频播放页打开扩展');
+    showNonVideoError(I18n.t('error_not_youtube'));
     return;
   }
 
@@ -204,16 +299,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           videoId = new URL(url).searchParams.get('v');
         }
 
-        // For title: document.title is the most reliable after SPA navigation.
-        // Clean it: remove "- YouTube" suffix and unread count like "(2)" at the START.
         let title = document.title.replace(/ - YouTube$/, '').trim();
         title = title.replace(/^\s*\(\d+\)\s*/, '').trim();
 
-        // Get duration - handle SPA navigation where ytInitialPlayerResponse and meta may be stale
         let duration = null;
 
-        // Method 1: ytInitialPlayerResponse (always has real video duration, even during ads)
-        // But on SPA navigation it's stale → must check videoId first
         try {
           if (typeof ytInitialPlayerResponse !== 'undefined' && ytInitialPlayerResponse) {
             if (ytInitialPlayerResponse.videoDetails?.videoId === videoId) {
@@ -223,8 +313,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
         } catch (e) {}
 
-        // Method 2: .ytp-time-duration from player controls (always updated on SPA nav)
-        // ONLY use it when an ad is NOT playing (during ads it shows ad duration)
         if (!duration) {
           try {
             const isAd = document.querySelector('.ytp-ad-player-overlay') ||
@@ -244,7 +332,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           } catch (e) {}
         }
 
-        // Method 3: Fallback to meta tag
         if (!duration) {
           const meta = document.querySelector('meta[itemprop="duration"]');
           if (meta) {
@@ -280,32 +367,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
     currentVideoId = info.videoId;
 
-    // Cache the video info
     cacheVideoInfo(currentVideoInfo);
 
-    // Notify background script that video info is ready
     chrome.runtime.sendMessage({ type: 'videoInfoReceived' }).catch(() => {});
 
     displayVideoInfo(currentVideoInfo);
 
-    // Show video immediately, don't hide while formats load
     showLoadingState(false);
     currentVideo.style.display = 'block';
-    // Update quality select to show loading
     qualitySelect.innerHTML = '';
-    addQualityOption('loading', '获取画质信息中，请稍等...', true);
+    addQualityOption('loading', I18n.t('status_loading_formats'), true);
 
-    // Skip getDownloadState - not needed for fresh fetch
-    // Directly fetch formats — skip cache since this is a fresh video
     log('Calling fetchFormats (fresh)...');
     fetchFormats(currentVideoInfo.url, false);
     log('Setup complete');
   } catch (err) {
     log(`Script execution failed: ${err.message}`);
-    // Fallback: get basic info from URL only
     try {
       let videoId = null;
-      // Check /shorts/ first (same pattern as lines 135-137)
       const shortsMatch = tab.url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
       if (shortsMatch) {
         videoId = shortsMatch[1];
@@ -316,17 +395,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentVideoInfo = {
           url: tab.url,
           videoId: videoId,
-          title: '视频',
+          title: I18n.t('video_unknown_title'),
           duration: null,
           thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
         };
         currentVideoId = videoId;
         displayVideoInfo(currentVideoInfo);
-        // Show video immediately, formats load in background
         showLoadingState(false);
         currentVideo.style.display = 'block';
         qualitySelect.innerHTML = '';
-        addQualityOption('loading', '获取画质信息中，请稍等...', true);
+        addQualityOption('loading', I18n.t('status_loading_formats'), true);
         fetchFormats(tab.url, false);
         log('Using fallback video info');
         return;
@@ -335,7 +413,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       log(`Fallback also failed: ${e.message}`);
     }
     showLoadingState(false);
-    showError('无法获取视频信息，请刷新页面后重试');
+    showError(I18n.t('error_cannot_get_info'));
     setDownloadReadyState();
   }
 
@@ -350,7 +428,6 @@ function cacheVideoInfo(info) {
   }
 }
 
-// Load cached video info from storage
 async function loadCachedVideoInfo() {
   cachedVideoInfo = null;
   if (storageLocal) {
@@ -366,7 +443,6 @@ async function loadCachedVideoInfo() {
   }
 }
 
-// Cache formats to storage
 let cachedFormats = null;
 let formatsByVideoId = {};
 function cacheFormats(formats) {
@@ -376,7 +452,6 @@ function cacheFormats(formats) {
   }
 }
 
-// Load cached formats from storage
 async function loadCachedFormats() {
   cachedFormats = null;
   formatsByVideoId = {};
@@ -397,12 +472,10 @@ async function loadCachedFormats() {
   }
 }
 
-// Show/hide loading state
 function showLoadingState(show) {
   loadingState.style.display = show ? 'flex' : 'none';
 }
 
-// Format duration in MM:SS or HH:MM:SS
 function formatDuration(seconds) {
   if (!seconds) return '--:--';
   if (seconds >= 3600) {
@@ -416,7 +489,6 @@ function formatDuration(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-// Format file size
 function formatSize(bytes) {
   if (!bytes) return '';
   if (bytes >= 1024 * 1024 * 1024) {
@@ -429,7 +501,6 @@ function formatSize(bytes) {
   return mb.toFixed(1) + 'MB';
 }
 
-// Load downloaded videos directly from storage
 function loadDownloadedVideos() {
   if (!storageLocal) {
     log('chrome.storage.local not available');
@@ -444,24 +515,20 @@ function loadDownloadedVideos() {
   });
 }
 
-// Save downloaded videos directly to storage
 function saveDownloadedVideos() {
   if (storageLocal) {
     storageLocal.set({ downloadedVideos });
   }
 }
 
-// Add downloaded video to list
 function addDownloadedVideo(videoInfo) {
   log('addDownloadedVideo called');
 
-  // Remove duplicate by filePath (same file = same download), but allow same videoId with different formats
   const dupIndex = downloadedVideos.findIndex(v => v.filePath === videoInfo.filePath);
   if (dupIndex >= 0) {
     downloadedVideos.splice(dupIndex, 1);
   }
 
-  // Add to beginning
   downloadedVideos.unshift({
     videoId: videoInfo.videoId,
     title: videoInfo.title,
@@ -473,16 +540,10 @@ function addDownloadedVideo(videoInfo) {
     qualityMeta: videoInfo.qualityMeta || null
   });
 
-  // Keep only last 20
   downloadedVideos = downloadedVideos.slice(0, 20);
-
-  // Mark this item for green border highlight
   window._justDownloadedPath = videoInfo.filePath;
-
-  // Always render the list immediately
   renderDownloadedList();
 
-  // Try to save to storage
   try {
     if (chrome.storage && chrome.storage.local) {
       chrome.storage.local.set({ downloadedVideos }, () => {
@@ -496,7 +557,6 @@ function addDownloadedVideo(videoInfo) {
   }
 }
 
-// Render downloaded videos list (shows 3 latest, expandable)
 function renderDownloadedList() {
   if (downloadedVideos.length === 0) {
     downloadedTitle.style.display = 'none';
@@ -512,6 +572,9 @@ function renderDownloadedList() {
   const showAll = downloadedListExpanded || downloadedVideos.length <= 3;
   const displayVideos = showAll ? downloadedVideos : downloadedVideos.slice(0, 3);
 
+  const folderTitle = I18n.t('btn_open_folder');
+  const deleteTitle = I18n.t('btn_delete_record');
+
   downloadedList.innerHTML = displayVideos.map(video => {
     const formatLabel = buildFormatLabel(video);
     const meta = video.qualityMeta;
@@ -526,39 +589,35 @@ function renderDownloadedList() {
         <div class="format-info">${escapeHtml(formatLabel)}</div>
       </div>
       <div class="actions">
-        <button class="mini-btn folder" data-path="${escapeAttr(video.filePath)}" title="打开文件夹">
+        <button class="mini-btn folder" data-path="${escapeAttr(video.filePath)}" title="${folderTitle}">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
         </button>
-        <button class="mini-btn delete" data-path="${escapeAttr(video.filePath)}" title="删除记录">
+        <button class="mini-btn delete" data-path="${escapeAttr(video.filePath)}" title="${deleteTitle}">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
         </button>
       </div>
     </div>
   `;}).join('');
 
-  // "查看全部" button — always shows same text, hides after expansion
   if (downloadedVideos.length > 3 && !downloadedListExpanded) {
     showMoreWrap.style.display = 'flex';
-    showMoreBtn.textContent = '查看全部';
+    showMoreBtn.textContent = I18n.t('btn_show_all');
   } else {
     showMoreWrap.style.display = 'none';
   }
 
-  // Add event listeners — whole item clickable to play
   downloadedList.querySelectorAll('.downloaded-item').forEach(item => {
     item.addEventListener('click', () => {
       playDownloaded(item.dataset.path);
     });
   });
 
-  // Add event listeners — folder button (stop propagation to avoid double-trigger)
   downloadedList.querySelectorAll('.mini-btn.folder').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       openDownloadedFolder(btn.dataset.path);
     });
   });
-  // Add event listeners — delete button
   downloadedList.querySelectorAll('.mini-btn.delete').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -567,19 +626,16 @@ function renderDownloadedList() {
   });
 }
 
-// Convert quality value to human-readable label
 function qualityToLabel(quality) {
   if (!quality) return '';
-  if (quality === 'best') return '最高';
-  if (quality === 'audio') return '音频';
+  if (quality === 'best') return I18n.t('quality_best');
+  if (quality === 'audio') return I18n.t('quality_audio');
   if (quality === '2160p') return '4K';
-  // Strip 'p' suffix
   const num = parseInt(quality);
   if (num > 0) return quality;
   return quality.replace(/p$/i, 'P');
 }
 
-// Build format label for downloaded video (e.g., "720P MP4 25MB")
 function buildFormatLabel(video) {
   const meta = video.qualityMeta;
   if (meta && meta.height) {
@@ -590,31 +646,25 @@ function buildFormatLabel(video) {
     if (sizeStr) parts.push(sizeStr);
     return parts.join(' ');
   }
-  // Fallback: use file extension from path
   const ext = video.filePath ? video.filePath.split('.').pop().toUpperCase() : '';
   const sizeStr = formatSize(video.filesize);
   return [ext, sizeStr].filter(Boolean).join(' ');
 }
 
-// Escape HTML entities
 function escapeHtml(str) {
   if (!str) return '';
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// Escape attribute for HTML
 function escapeAttr(str) {
   if (!str) return '';
   return str.replace(/'/g, "\\'").replace(/"/g, '\\"');
 }
 
-// Play downloaded video
 function playDownloaded(filePath) {
   log('playDownloaded called, filePath: ' + filePath);
   try {
     const port = chrome.runtime.connectNative('com.stardownload.host');
-    // Send a single playFile action — native host will remove quarantine
-    // and open the file in one go, avoiding race conditions with port lifetime
     port.postMessage({ action: 'playFile', filePath: filePath });
     setTimeout(() => {
       try { port.disconnect(); } catch(e) {}
@@ -624,19 +674,16 @@ function playDownloaded(filePath) {
   }
 }
 
-// Open folder for downloaded video
 function openDownloadedFolder(filePath) {
   log('openDownloadedFolder called, filePath: ' + filePath);
   try {
     const port = chrome.runtime.connectNative('com.stardownload.host');
     port.postMessage({ action: 'openFolder', filePath: filePath });
-    // Don't disconnect immediately - let Chrome flush the message to the native host
   } catch (err) {
     log(`openDownloadedFolder error: ${err.message}`);
   }
 }
 
-// Delete a downloaded video record
 function deleteDownloadedVideo(filePath) {
   log('deleteDownloadedVideo called, filePath: ' + filePath);
   downloadedVideos = downloadedVideos.filter(v => v.filePath !== filePath);
@@ -644,20 +691,16 @@ function deleteDownloadedVideo(filePath) {
   renderDownloadedList();
 }
 
-// Fetch available formats from native host
 function fetchFormats(url, useCached = true) {
   log(`fetchFormats called with URL: ${url}, useCached=${useCached}`);
 
-  // Check per-videoId cache first (filled by background prefetch or previous load)
   if (useCached && currentVideoId && formatsByVideoId[currentVideoId]) {
     log(`Using per-videoId cached formats for ${currentVideoId}`);
     populateQualitySelect(formatsByVideoId[currentVideoId].formats);
-    // Still fetch in background to update cache
     fetchFormatsFromNative(url);
     return;
   }
 
-  // Fall back to global cache
   if (useCached && cachedFormats) {
     log('Using global cached formats');
     populateQualitySelect(cachedFormats);
@@ -665,7 +708,6 @@ function fetchFormats(url, useCached = true) {
     return;
   }
 
-  // No cached formats, fetch from native
   fetchFormatsFromNative(url);
 }
 
@@ -679,7 +721,7 @@ function fetchFormatsFromNative(url) {
     showLoadingState(false);
     currentVideo.style.display = 'block';
     qualitySelect.innerHTML = '';
-    addQualityOption('best', '最高画质 (格式获取超时)', true);
+    addQualityOption('best', I18n.t('quality_formats_timeout'), true);
     setDownloadReadyState();
   }, 15000);
 
@@ -694,7 +736,6 @@ function fetchFormatsFromNative(url) {
       if (timedOut) return;
       if (response.type === 'formats') {
         log(`Formats received: ${JSON.stringify(response.formats)}`);
-        // Cache the formats
         cacheFormats(response.formats);
         populateQualitySelect(response.formats);
       } else if (response.type === 'error') {
@@ -707,7 +748,6 @@ function fetchFormatsFromNative(url) {
       log('Port disconnected');
       clearTimeout(timeoutId);
       if (!timedOut) {
-        // Only fallback to cached formats — never clear the select
         if (cachedFormats) {
           populateQualitySelect(cachedFormats);
         }
@@ -728,26 +768,22 @@ function fetchFormatsFromNative(url) {
   }
 }
 
-// Populate quality select with all available formats
 function populateQualitySelect(formats) {
   qualitySelect.innerHTML = '';
 
   showLoadingState(false);
   currentVideo.style.display = 'block';
 
-  // Notify background that formats are ready → icon green
   chrome.runtime.sendMessage({ type: 'formatsReady' }).catch(() => {});
 
   if (!formats || formats.length === 0) {
-    addQualityOption('best', '最高画质', true);
+    addQualityOption('best', I18n.t('quality_best'), true);
     setDownloadReadyState();
     return;
   }
 
-  // Helper: convert height to display label (e.g. 2160 → 4K)
   const heightLabel = (h) => h === 2160 ? '4K' : `${h}p`;
 
-  // Container priority: MP4 first, then others alphabetically
   const extRank = (ext) => {
     const e = (ext || '').toLowerCase();
     if (e === 'mp4') return 0;
@@ -755,7 +791,6 @@ function populateQualitySelect(formats) {
     return 2;
   };
 
-  // Codec priority: H.264 first (most compatible), then AV1, VP9, VP8, others
   const codecRank = (codec) => {
     if (!codec) return 10;
     if (codec === 'H.264') return 0;
@@ -767,11 +802,9 @@ function populateQualitySelect(formats) {
     return 9;
   };
 
-  // Separate video and audio formats (exclude mhtml)
   const videoFmts = formats.filter(f => f.height && f.ext !== 'mhtml');
   const audioFmts = formats.filter(f => !f.height && f.ext !== 'mhtml');
 
-  // Sort video formats: height desc → container priority → codec priority → size asc
   videoFmts.sort((a, b) => {
     if (b.height !== a.height) return b.height - a.height;
     const extDiff = extRank(a.ext) - extRank(b.ext);
@@ -781,26 +814,22 @@ function populateQualitySelect(formats) {
     return (a.filesize || 0) - (b.filesize || 0);
   });
 
-  // Sort audio formats: codec priority → size asc
   audioFmts.sort((a, b) => {
     const codecDiff = codecRank(a.codec) - codecRank(b.codec);
     if (codecDiff !== 0) return codecDiff;
     return (a.filesize || 0) - (b.filesize || 0);
   });
 
-  // Default: first MP4 format (highest resolution MP4)
   let defaultSelected = false;
   const defaultMp4 = videoFmts.find(f => (f.ext || '').toLowerCase() === 'mp4');
   if (defaultMp4) defaultMp4._default = true;
 
-  // Find best audio size to add to video-only formats (since download merges video+audio)
   let bestAudioSize = 0;
   if (audioFmts.length > 0) {
     const bestAudio = audioFmts.reduce((best, f) => (f.filesize || 0) > (best.filesize || 0) ? f : best, audioFmts[0]);
     bestAudioSize = bestAudio.filesize || 0;
   }
 
-  // Build label for a video format (add audio size since download merges video+audio)
   const buildVideoLabel = (fmt) => {
     const h = heightLabel(fmt.height);
     const parts = [h];
@@ -812,7 +841,6 @@ function populateQualitySelect(formats) {
     return parts.join(' ');
   };
 
-  // Add video formats
   for (const fmt of videoFmts) {
     const label = buildVideoLabel(fmt);
     const selected = fmt._default || false;
@@ -820,17 +848,15 @@ function populateQualitySelect(formats) {
     if (selected) defaultSelected = true;
   }
 
-  // Add separator if there are both video and audio formats
   if (videoFmts.length > 0 && audioFmts.length > 0) {
     const sep = document.createElement('option');
     sep.disabled = true;
-    sep.textContent = '────────── 仅音频 ──────────';
+    sep.textContent = I18n.t('section_audio_separator');
     qualitySelect.appendChild(sep);
   }
 
-  // Build label for an audio format
   const buildAudioLabel = (fmt) => {
-    const parts = ['音频'];
+    const parts = [I18n.t('quality_audio')];
     if (fmt.codec) parts.push(fmt.codec);
     parts.push((fmt.ext || '').toUpperCase());
     const sizeStr = formatSize(fmt.filesize);
@@ -838,12 +864,10 @@ function populateQualitySelect(formats) {
     return parts.join(' ');
   };
 
-  // Add audio formats
   for (const fmt of audioFmts) {
     addQualityOption(fmt.id, buildAudioLabel(fmt));
   }
 
-  // Restore previously selected quality (e.g. after popup reopen during paused download)
   if (pendingQualityRestore) {
     const q = pendingQualityRestore;
     const match = qualitySelect.querySelector(`option[value="${CSS.escape(q)}"]`);
@@ -856,19 +880,15 @@ function populateQualitySelect(formats) {
 
   log(`Quality select populated with ${qualitySelect.options.length} options`);
 
-  // Set button ready state
   downloadBtn.disabled = false;
-  btnText.textContent = '下载';
+  btnText.textContent = I18n.t('btn_download');
   completionSection.style.display = 'none';
   errorSection.style.display = 'none';
 
-  // Show download button only if no active progress/completed state
-  // (restoreDownloadState shows thickProgress/downloadCompleted; don't overwrite)
   if (thickProgress.style.display !== 'block' && downloadCompleted.style.display !== 'flex') {
     showDownloadBtn();
   }
 
-  // Sync formats to per-videoId cache so background can keep icon green
   if (currentVideoId && storageLocal && formats.length > 0) {
     storageLocal.get(['formatsCacheByVideoId'], (result) => {
       const cache = result.formatsCacheByVideoId || {};
@@ -879,7 +899,6 @@ function populateQualitySelect(formats) {
   }
 }
 
-// Add option to quality select
 function addQualityOption(value, label, selected = false) {
   const option = document.createElement('option');
   option.value = value;
@@ -888,17 +907,14 @@ function addQualityOption(value, label, selected = false) {
   qualitySelect.appendChild(option);
 }
 
-// Add logging helper
 function log(msg) {
   console.log(`[StarDownload Popup] ${msg}`);
 }
 
-// Display video information
 function displayVideoInfo(info) {
   thumbnail.src = info.thumbnail;
   videoTitle.textContent = info.title;
 
-  // Show duration badge if available - NOT tied to thumbnail load state
   if (info.duration) {
     durationBadge.textContent = formatDuration(Math.floor(info.duration / 1000));
     durationBadge.style.display = 'block';
@@ -907,7 +923,6 @@ function displayVideoInfo(info) {
   }
 }
 
-// Refresh title and duration from page (used when showing cached data)
 async function refreshVideoMeta(tabId, expectedVideoId) {
   try {
     const results = await chrome.scripting.executeScript({
@@ -925,7 +940,6 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
           videoId = new URL(location.href).searchParams.get('v');
         }
 
-        // Method 1: ytInitialPlayerResponse (reliable but stale on SPA nav)
         try {
           if (typeof ytInitialPlayerResponse !== 'undefined' && ytInitialPlayerResponse) {
             if (ytInitialPlayerResponse.videoDetails?.videoId === videoId) {
@@ -935,7 +949,6 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
           }
         } catch (e) {}
 
-        // Method 2: .ytp-time-duration (always updated on SPA nav, but shows ad duration during ads)
         if (!duration) {
           try {
             const isAd = document.querySelector('.ytp-ad-player-overlay') ||
@@ -952,7 +965,6 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
           } catch (e) {}
         }
 
-        // Method 3: meta tag
         if (!duration) {
           const meta = document.querySelector('meta[itemprop="duration"]');
           if (meta && meta.getAttribute('content')) {
@@ -970,7 +982,6 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
     if (!meta) return;
     log(`Refreshed meta: title="${meta.title}", duration=${meta.duration}`);
 
-    // Only update if the video hasn't changed since we started
     if (currentVideoId === expectedVideoId) {
       if (meta.title && meta.title !== currentVideoInfo.title) {
         currentVideoInfo.title = meta.title;
@@ -981,7 +992,6 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
         durationBadge.textContent = formatDuration(Math.floor(meta.duration / 1000));
         durationBadge.style.display = 'block';
       }
-      // Update cache with fresh data
       cacheVideoInfo(currentVideoInfo);
     }
   } catch (err) {
@@ -989,12 +999,11 @@ async function refreshVideoMeta(tabId, expectedVideoId) {
   }
 }
 
-// Start download process (delegates to background service worker)
 function startDownload() {
   log('startDownload called');
   if (!currentVideoInfo) {
     log('No video info, showing error');
-    showError('视频信息无效');
+    showError(I18n.t('error_invalid_info'));
     return;
   }
 
@@ -1005,7 +1014,6 @@ function startDownload() {
   const quality = qualitySelect.value;
   log(`Quality selected: ${quality}`);
 
-  // Capture format metadata (resolution, ext, codec) for downloaded list display
   let qualityMeta = null;
   if (cachedFormats) {
     const fmt = cachedFormats.find(f => f.id === quality);
@@ -1021,7 +1029,6 @@ function startDownload() {
 
   lastDownloadRequest = { qualityMeta };
 
-  // Send download command to background (which manages the native port)
   chrome.runtime.sendMessage({
     type: 'startDownload',
     url: currentVideoInfo.url,
@@ -1035,13 +1042,11 @@ function startDownload() {
   watchDownloadState();
 }
 
-// Toggle pause/resume download
 function togglePauseDownload() {
   if (downloadPaused) {
-    // Resume
     downloadPaused = false;
     thickProgress.classList.remove('paused');
-    progressPauseBtn.title = '暂停';
+    progressPauseBtn.title = I18n.t('btn_pause');
     progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
     chrome.runtime.sendMessage({
       type: 'startDownload',
@@ -1054,17 +1059,15 @@ function togglePauseDownload() {
     }).catch(() => {});
     watchDownloadState();
   } else {
-    // Pause: tell background to pause
     downloadPaused = true;
     thickProgress.classList.add('paused');
-    thickProgressLabel.textContent = '已暂停';
-    progressPauseBtn.title = '继续下载';
+    thickProgressLabel.textContent = I18n.t('status_paused');
+    progressPauseBtn.title = I18n.t('btn_resume');
     progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
     chrome.runtime.sendMessage({ type: 'pauseDownload' }).catch(() => {});
   }
 }
 
-// Cancel download and return to initial state
 function cancelDownload() {
   log('cancelDownload called');
   downloadPaused = false;
@@ -1077,31 +1080,26 @@ function cancelDownload() {
   resetState();
 }
 
-// Show download button (hide thick progress bar and completed state)
 function showDownloadBtn() {
   downloadBtn.style.display = 'block';
   thickProgress.style.display = 'none';
   downloadCompleted.style.display = 'none';
 }
 
-// Show completed state after download finishes
 function showDownloadCompleted() {
   downloadBtn.style.display = 'none';
   thickProgress.style.display = 'none';
   downloadCompleted.style.display = 'flex';
 }
 
-// Show thick progress bar (hide download button)
 function showThickProgress() {
   downloadBtn.style.display = 'none';
   thickProgress.style.display = 'block';
   thickProgress.classList.remove('paused');
-  // Reset pause icon to pause (two bars)
-  progressPauseBtn.title = '暂停';
+  progressPauseBtn.title = I18n.t('btn_pause');
   progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
 }
 
-// Watch downloadState changes in storage (for real-time progress)
 function watchDownloadState() {
   if (storageChangeListener) {
     chrome.storage.onChanged.removeListener(storageChangeListener);
@@ -1116,7 +1114,7 @@ function watchDownloadState() {
       case 'downloading':
         if (!downloadPaused) {
           thickProgress.classList.remove('paused');
-          progressPauseBtn.title = '暂停';
+          progressPauseBtn.title = I18n.t('btn_pause');
           updateProgress(state.progress, state.statusText, state.speed);
           showThickProgress();
         }
@@ -1124,9 +1122,9 @@ function watchDownloadState() {
       case 'paused':
         thickProgress.classList.add('paused');
         showThickProgress();
-        updateProgress(state.progress, '下载已暂停');
-        thickProgressLabel.textContent = '已暂停';
-        progressPauseBtn.title = '继续下载';
+        updateProgress(state.progress, I18n.t('status_paused'));
+        thickProgressLabel.textContent = I18n.t('status_paused');
+        progressPauseBtn.title = I18n.t('btn_resume');
         progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
         downloadPaused = true;
         break;
@@ -1138,8 +1136,7 @@ function watchDownloadState() {
         }
         showDownloadCompleted();
         thickProgressFill.style.width = '0%';
-        thickProgressLabel.textContent = '正在下载';
-        // Add to downloaded list
+        thickProgressLabel.textContent = I18n.t('status_downloading');
         addDownloadedVideo({
           videoId: currentVideoId,
           title: currentVideoInfo?.title || cachedVideoInfo?.title || '',
@@ -1170,7 +1167,6 @@ function watchDownloadState() {
   chrome.storage.onChanged.addListener(storageChangeListener);
 }
 
-// Restore download state when popup opens (e.g., download was started and popup was closed)
 async function restoreDownloadState() {
   return new Promise((resolve) => {
     if (!storageLocal) {
@@ -1186,7 +1182,6 @@ async function restoreDownloadState() {
 
       log(`Restoring download state: status=${state.status}, progress=${state.progress}`);
 
-      // Reconstruct video info from cache
       if (cachedVideoInfo && state.videoId && cachedVideoInfo.videoId === state.videoId) {
         currentVideoInfo = cachedVideoInfo;
         currentVideoId = cachedVideoInfo.videoId;
@@ -1194,7 +1189,7 @@ async function restoreDownloadState() {
         currentVideoId = state.videoId;
         currentVideoInfo = {
           videoId: state.videoId,
-          title: state.videoTitle || '视频',
+          title: state.videoTitle || I18n.t('video_unknown_title'),
           url: state.videoId ? `https://www.youtube.com/watch?v=${state.videoId}` : '',
           thumbnail: state.videoId ? `https://i.ytimg.com/vi/${state.videoId}/mqdefault.jpg` : ''
         };
@@ -1208,11 +1203,10 @@ async function restoreDownloadState() {
           displayVideoInfo(currentVideoInfo);
           showThickProgress();
           thickProgress.classList.remove('paused');
-          progressPauseBtn.title = '暂停';
+          progressPauseBtn.title = I18n.t('btn_pause');
           downloadPaused = false;
-          updateProgress(state.progress, state.statusText || '下载中...');
+          updateProgress(state.progress, state.statusText || I18n.t('status_downloading_dots'));
           watchDownloadState();
-          // Also fetch formats in background for when download completes
           pendingQualityRestore = state.quality || null;
           if (currentVideoInfo.url) {
             fetchFormats(currentVideoInfo.url);
@@ -1224,9 +1218,9 @@ async function restoreDownloadState() {
           showThickProgress();
           thickProgress.classList.add('paused');
           downloadPaused = true;
-          updateProgress(state.progress, '下载已暂停');
-          thickProgressLabel.textContent = '已暂停';
-          progressPauseBtn.title = '继续下载';
+          updateProgress(state.progress, I18n.t('status_paused'));
+          thickProgressLabel.textContent = I18n.t('status_paused');
+          progressPauseBtn.title = I18n.t('btn_resume');
           progressPauseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';
           watchDownloadState();
           pendingQualityRestore = state.quality || null;
@@ -1236,11 +1230,9 @@ async function restoreDownloadState() {
           break;
 
         case 'complete':
-          // Add to downloaded list (don't show old completion section)
           displayVideoInfo(currentVideoInfo);
           downloadComplete = true;
           showDownloadCompleted();
-          // Populate quality select from cache (needed for "重新下载" button)
           if (formatsByVideoId[currentVideoId] && formatsByVideoId[currentVideoId].formats) {
             log(`Complete case: loading formats from cache for ${currentVideoId}`);
             populateQualitySelect(formatsByVideoId[currentVideoId].formats);
@@ -1249,7 +1241,6 @@ async function restoreDownloadState() {
             fetchFormats(currentVideoInfo.url);
           }
           if (state.filePath) {
-            // Add to downloaded list
             addDownloadedVideo({
               videoId: currentVideoId,
               title: currentVideoInfo?.title || state.videoTitle || '',
@@ -1259,13 +1250,12 @@ async function restoreDownloadState() {
               filesize: state.filesize || 0,
               qualityMeta: state.qualityMeta || null
             });
-            // Reset state to idle so next open doesn't show completion again
             chrome.runtime.sendMessage({ type: 'cancelDownload' }).catch(() => {});
           }
           break;
 
         case 'error':
-          showError(state.errorMessage || '下载出错');
+          showError(state.errorMessage || I18n.t('error_download_failed'));
           chrome.runtime.sendMessage({ type: 'cancelDownload' }).catch(() => {});
           break;
 
@@ -1274,7 +1264,6 @@ async function restoreDownloadState() {
           return;
       }
 
-      // Clean up listener on popup close
       window.addEventListener('beforeunload', () => {
         if (storageChangeListener) {
           chrome.storage.onChanged.removeListener(storageChangeListener);
@@ -1287,38 +1276,36 @@ async function restoreDownloadState() {
   });
 }
 
-// Try to update yt-dlp after download failure
 async function tryUpdateYtDlp() {
   try {
     const port = chrome.runtime.connectNative('com.stardownload.host');
     port.onMessage.addListener((response) => {
       if (response.type === 'versionCheck') {
         if (response.needsUpdate) {
-          statusText.textContent = '正在更新 yt-dlp...';
+          statusText.textContent = I18n.t('status_updating_ytdlp');
         } else {
-          showError('视频格式不可用，可能是 YouTube 限制');
+          showError(I18n.t('error_format_unavailable'));
         }
       } else if (response.type === 'updateComplete') {
         port.disconnect();
         if (response.success) {
-          showError('yt-dlp 已更新，请重试下载');
+          showError(I18n.t('error_ytdlp_updated'));
         } else {
-          showError('yt-dlp 更新失败，请手动更新: pipx install yt-dlp');
+          showError(I18n.t('error_ytdlp_update_failed'));
         }
       }
     });
     port.postMessage({ action: 'checkAndUpdate' });
     port.onDisconnect.addListener(() => {});
   } catch (err) {
-    showError('无法检查 yt-dlp 版本');
+    showError(I18n.t('error_cannot_check_version'));
   }
 }
 
-// Update progress display
 function updateProgress(percent, status, speed) {
   thickProgressFill.style.width = `${percent}%`;
   if (percent <= 0) {
-    thickProgressLabel.textContent = '正在下载';
+    thickProgressLabel.textContent = I18n.t('status_downloading');
   } else if (speed) {
     thickProgressLabel.textContent = speed;
   } else {
@@ -1326,7 +1313,6 @@ function updateProgress(percent, status, speed) {
   }
 }
 
-// Show completion state (keep video section visible)
 function showCompletion(path) {
   completionSection.style.display = 'block';
   filePath.textContent = path;
@@ -1334,7 +1320,6 @@ function showCompletion(path) {
   log('showCompletion - completed section shown');
 }
 
-// Show error state
 function showError(message) {
   log(`showError called: ${message}`);
   currentVideo.style.display = 'block';
@@ -1342,11 +1327,10 @@ function showError(message) {
   errorSection.style.display = 'block';
   errorMessage.textContent = message;
   downloadBtn.disabled = false;
-  btnText.textContent = '下载';
+  btnText.textContent = I18n.t('btn_download');
   showDownloadBtn();
 }
 
-// Show non-video page error (hide video section, show only error)
 function showNonVideoError(message) {
   log(`showNonVideoError: ${message}`);
   showLoadingState(false);
@@ -1366,19 +1350,17 @@ function showNonVideoError(message) {
   errorSection.style.display = 'none';
 }
 
-// Set downloading state
 function setDownloadingState() {
   showThickProgress();
   thickProgressFill.style.width = '0%';
-  thickProgressLabel.textContent = '正在下载';
+  thickProgressLabel.textContent = I18n.t('status_downloading');
   completionSection.style.display = 'none';
   errorSection.style.display = 'none';
 }
 
-// Reset to initial state
 function resetState() {
   downloadBtn.disabled = false;
-  btnText.textContent = '下载';
+  btnText.textContent = I18n.t('btn_download');
   showDownloadBtn();
   thickProgressFill.style.width = '0%';
   thickProgressLabel.textContent = '0%';
@@ -1387,11 +1369,10 @@ function resetState() {
   currentVideo.style.display = 'block';
 }
 
-// Set download ready state
 function setDownloadReadyState() {
   log('setDownloadReadyState called');
   downloadBtn.disabled = false;
-  btnText.textContent = '下载';
+  btnText.textContent = I18n.t('btn_download');
   showDownloadBtn();
   thickProgressFill.style.width = '0%';
   thickProgressLabel.textContent = '0%';
@@ -1399,41 +1380,36 @@ function setDownloadReadyState() {
   errorSection.style.display = 'none';
 }
 
-// Play video (via native host)
 function playVideo() {
   log('playVideo called, filePath: ' + filePath.textContent);
   try {
     const path = filePath.textContent;
     if (!path) {
-      showError('文件路径无效');
+      showError(I18n.t('error_invalid_path'));
       return;
     }
     const port = chrome.runtime.connectNative('com.stardownload.host');
     port.postMessage({ action: 'openFile', filePath: path });
-    // Don't disconnect immediately - let Chrome flush the message to the native host
   } catch (err) {
-    showError('无法打开视频：' + err.message);
+    showError(I18n.t('error_cannot_play') + err.message);
   }
 }
 
-// Open folder (via native host)
 function openFolder() {
   log('openFolder called, filePath: ' + filePath.textContent);
   try {
     const path = filePath.textContent;
     if (!path) {
-      showError('文件路径无效');
+      showError(I18n.t('error_invalid_path'));
       return;
     }
     const port = chrome.runtime.connectNative('com.stardownload.host');
     port.postMessage({ action: 'openFolder', filePath: path });
-    // Don't disconnect immediately - let Chrome flush the message to the native host
   } catch (err) {
-    showError('无法打开文件夹：' + err.message);
+    showError(I18n.t('error_cannot_open_folder') + err.message);
   }
 }
 
-// Check if native host is available by sending a ping
 function checkNativeHost() {
   return new Promise((resolve) => {
     let resolved = false;
@@ -1485,7 +1461,6 @@ function checkNativeHost() {
   });
 }
 
-// Show the setup/installation guide UI
 function showSetupUI() {
   showLoadingState(false);
   currentVideo.style.display = 'none';
@@ -1494,8 +1469,11 @@ function showSetupUI() {
   errorSection.style.display = 'none';
   setupSection.style.display = 'flex';
 
-  // Set OS-specific text
-  const terminalName = currentOS === 'win' ? 'PowerShell' : '终端';
+  updateSetupUI();
+}
+
+function updateSetupUI() {
+  const terminalName = currentOS === 'win' ? I18n.t('setup_terminal_windows') : I18n.t('setup_terminal_mac');
   const setupTerminalName = document.getElementById('setupTerminalName');
   const setupTerminalName2 = document.getElementById('setupTerminalName2');
   if (setupTerminalName) setupTerminalName.textContent = terminalName;
@@ -1504,25 +1482,23 @@ function showSetupUI() {
   const setupCommandDisplay = document.getElementById('setupCommandDisplay');
   if (setupCommandDisplay) {
     setupCommandDisplay.textContent = currentOS === 'win'
-      ? 'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install.ps1"'
-      : 'bash ~/Downloads/install.sh';
+      ? I18n.t('setup_command_windows')
+      : I18n.t('setup_command_mac');
   }
 
   const setupDownloadHint = document.getElementById('setupDownloadHint');
   if (setupDownloadHint) {
     setupDownloadHint.textContent = currentOS === 'win'
-      ? '下载到 %USERPROFILE%\\Downloads'
-      : '下载到 ~/Downloads';
+      ? I18n.t('setup_download_hint_windows')
+      : I18n.t('setup_download_hint_mac');
   }
 
-  // Update install button label
-  downloadInstallBtn.textContent = currentOS === 'win' ? '2. 下载 install.ps1' : '2. 下载 install.sh';
+  downloadInstallBtn.textContent = currentOS === 'win'
+    ? I18n.t('btn_install_script_windows')
+    : I18n.t('btn_install_script_mac');
 }
 
-// Generate the macOS install.sh script content
 function generateMacInstallScript(extensionId) {
-  // NOTE: In JS template literals, \${X} escapes ${X} so it appears literally
-  // in the output. The unquoted heredoc below allows bash to expand ${HOME}.
   const lines = [
     '#!/bin/bash',
     'set -e',
@@ -1608,7 +1584,6 @@ function generateMacInstallScript(extensionId) {
   return lines.join('\n');
 }
 
-// Generate the Windows install.ps1 PowerShell script
 function generateWindowsInstallScript(extensionId) {
   const lines = [
     '# StarDownload Windows Install Script',
@@ -1769,7 +1744,6 @@ function generateWindowsInstallScript(extensionId) {
   return lines.join('\r\n');
 }
 
-// Dispatch to OS-specific install script
 function generateInstallScript(extensionId) {
   if (currentOS === 'win') {
     return generateWindowsInstallScript(extensionId);
@@ -1777,7 +1751,6 @@ function generateInstallScript(extensionId) {
   return generateMacInstallScript(extensionId);
 }
 
-// Download a file as blob to user's downloads folder (stardownload.py)
 async function downloadStardownloadPy() {
   try {
     const response = await fetch(chrome.runtime.getURL('native/stardownload.py'));
@@ -1792,17 +1765,16 @@ async function downloadStardownloadPy() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    const downloadPath = currentOS === 'win' ? '%USERPROFILE%\\Downloads' : '~/Downloads';
-    setupHint.textContent = '\u2713 stardownload.py 已下载到 ' + downloadPath;
+    const downloadPath = currentOS === 'win' ? I18n.t('setup_download_hint_windows') : I18n.t('setup_download_hint_mac');
+    setupHint.textContent = '\u2713 stardownload.py ' + I18n.t('setup_downloaded_to') + ' ' + downloadPath;
     setupHint.style.color = '#02CF66';
   } catch (e) {
     log(`stardownload.py download failed: ${e.message}`);
-    setupHint.textContent = '下载失败，请重试';
+    setupHint.textContent = I18n.t('error_script_download_failed');
     setupHint.style.color = '#ff6b6b';
   }
 }
 
-// Download install script to user's downloads folder
 function downloadInstallScript() {
   const extensionId = chrome.runtime.id;
   const content = generateInstallScript(extensionId);
@@ -1816,12 +1788,11 @@ function downloadInstallScript() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  const downloadPath = currentOS === 'win' ? '%USERPROFILE%\\Downloads' : '~/Downloads';
-  setupHint.textContent = '\u2713 ' + filename + ' 已下载到 ' + downloadPath;
+  const downloadPath = currentOS === 'win' ? I18n.t('setup_download_hint_windows') : I18n.t('setup_download_hint_mac');
+  setupHint.textContent = '\u2713 ' + filename + ' ' + I18n.t('setup_downloaded_to') + ' ' + downloadPath;
   setupHint.style.color = '#02CF66';
 }
 
-// Bind setup section event listeners
 function setupEventListeners() {
   downloadScriptBtn.addEventListener('click', () => {
     downloadStardownloadPy();
@@ -1834,29 +1805,26 @@ function setupEventListeners() {
   copyRunCmdBtn.addEventListener('click', async () => {
     try {
       const cmd = currentOS === 'win'
-        ? 'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install.ps1"'
-        : 'bash ~/Downloads/install.sh';
+        ? I18n.t('setup_command_windows')
+        : I18n.t('setup_command_mac');
       await navigator.clipboard.writeText(cmd);
-      setupHint.textContent = '\u2713 命令已复制';
+      setupHint.textContent = '\u2713 ' + I18n.t('setup_copied');
       setupHint.style.color = '#02CF66';
     } catch (e) {
-      setupHint.textContent = '复制失败';
+      setupHint.textContent = I18n.t('setup_copy_failed');
       setupHint.style.color = '#ff6b6b';
     }
   });
 
-  // "..." menu toggle
   moreMenuBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     const visible = moreMenuDropdown.style.display === 'block';
     moreMenuDropdown.style.display = visible ? 'none' : 'block';
   });
 
-  // Delete all history
   clearAllHistory.addEventListener('click', () => {
     downloadedVideos = [];
     saveDownloadedVideos();
-    // Also clear in background's storage
     if (storageLocal) {
       storageLocal.set({ downloadedVideos: [] });
     }
@@ -1865,11 +1833,9 @@ function setupEventListeners() {
     moreMenuDropdown.style.display = 'none';
   });
 
-  // "Show more" button — always expand, never collapse
   showMoreBtn.addEventListener('click', () => {
     downloadedListExpanded = true;
     renderDownloadedList();
-    // Hide video section and download controls when expanding
     currentVideo.style.display = 'none';
     downloadBtn.style.display = 'none';
     thickProgress.style.display = 'none';
@@ -1879,7 +1845,6 @@ function setupEventListeners() {
     downloadedList.style.maxHeight = '400px';
   });
 
-  // Close dropdown on click outside
   document.addEventListener('click', () => {
     moreMenuDropdown.style.display = 'none';
   });
