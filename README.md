@@ -2,7 +2,9 @@
 
 一键下载 YouTube 视频的浏览器扩展，所有处理均在本地完成。
 
-> 目前支持Chromium浏览器，如Google Chromium、Microsoft Edge浏览器，Windows和Mac平台
+> 目前支持Chromium浏览器，如Microsoft Edge、Google Chromium、360安全浏览器，
+
+  支持Windows和Mac平台
   
 
 ## 功能
@@ -32,9 +34,11 @@ YouTube 页面 → 扩展获取视频信息 → Native Messaging → 本地 Pyth
 
 ### 从商店安装（推荐）
 
-从 Edge 扩展商店搜索「Shooting Star Downloader」安装。（还没有发布，在审核中）
+从 Edge 或360安全浏览器扩展商店搜索「流星视频下载」安装。（还没有发布，在审核中）
 
-首次使用时会自动弹出安装引导，引导你安装 yt-dlp 和 FFmpeg，无需手动配置。
+首次使用时会自动弹出安装引导，引导下载两个安装文件，然后复制命令到终端里运行一键安装 yt-dlp 和 FFmpeg，无需手动配置。
+
+如果本地已经安装了 yt-dlp 和 FFmpeg，会自动跳过，不会重复安装。
 
 ### 开发者模式加载
 
