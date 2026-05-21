@@ -15,9 +15,9 @@
 
 ## 界面截图
 
-![主界面](screenshots/main.jpg)
-![选择格式](screenshots/choose-format.jpg)
-![下载中](screenshots/downloading.jpg)
+<img src="screenshots/main.jpg" alt="主界面" width="400">
+<img src="screenshots/choose-format.jpg" alt="选择格式" width="400">
+<img src="screenshots/downloading.jpg" alt="下载中" width="400">
 
 ## 原理
 
