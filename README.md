@@ -2,10 +2,7 @@
 
 一键下载 YouTube 视频的浏览器扩展，所有处理均在本地完成。
 
-> 目前支持Chromium浏览器，如Microsoft Edge、Google Chromium、360安全浏览器，
-
-  支持Windows和Mac平台
-  
+> 目前支持 Chromium 内核浏览器，如 Microsoft Edge、Google Chrome、360 安全浏览器，支持 Windows 和 macOS 平台
 
 ## 功能
 
@@ -15,6 +12,12 @@
 - 实时显示下载进度，支持暂停和恢复
 - 下载完成后可在扩展内直接播放或打开文件所在文件夹
 - 支持中英文界面切换
+
+## 界面截图
+
+![主界面](screenshots/main.jpg)
+![选择格式](screenshots/choose-format.jpg)
+![下载中](screenshots/downloading.jpg)
 
 ## 原理
 
