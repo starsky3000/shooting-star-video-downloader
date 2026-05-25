@@ -1,3 +1,7 @@
+<p align="right">
+  <a href="README_US.md">English</a>
+</p>
+
 # Shooting Star Downloader（流星视频下载）
 
 一键下载 YouTube 视频的浏览器扩展，所有处理均在本地完成。
@@ -44,7 +48,7 @@ YouTube 页面 → 扩展获取视频信息 → Native Messaging → 本地 Pyth
 ### 开发者模式加载
 
 1. 克隆本项目
-2. 打开Chromium浏览器，进入 `chrome://extensions/`
+2. 打开 Chromium 浏览器，进入 `chrome://extensions/`
 3. 开启「开发者模式」
 4. 点击「加载已解压的扩展程序」，选择本项目目录
 

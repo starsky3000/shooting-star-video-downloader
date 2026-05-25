@@ -17,6 +17,12 @@ Thumbs.db
 # Dependencies
 node_modules/
 
+# Native host config (contains user-specific paths/IDs)
+native/com.stardownload.host.json
+
+# Backup files
+*.bak
+
 # Build output
 *.crx
 *.pem

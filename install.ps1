@@ -132,7 +132,7 @@ $manifestJson = @{
     description = "StarDownload Native Host for YouTube Downloads"
     path = "$installDir\stardownload.py"
     type = "stdio"
-    allowed_origins = @("chrome-extension://mgmjpjcfloadhpdncklaiepeongpfpla/")
+    allowed_origins = @("chrome-extension://<YOUR_EXTENSION_ID>/")
 }
 $manifestPath = Join-Path $installDir "com.stardownload.host.json"
 $manifestJson | ConvertTo-Json | Set-Content -Path $manifestPath -Encoding UTF8
