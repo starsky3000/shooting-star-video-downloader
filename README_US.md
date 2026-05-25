@@ -1,4 +1,4 @@
-<p align="right">
+<p>
   <a href="README.md">中文</a>
 </p>
 
@@ -41,7 +41,7 @@ Everything runs locally — no user data is ever uploaded.
 
 ### Install from Store (Recommended)
 
-[![Edge Add-ons](https://img.shields.io/badge/Edge%20Add--ons-Shooting%20Star%20Downloader-0078D7?logo=microsoftedge)](https://microsoftedge.microsoft.com/addons/detail/%E6%B5%81%E6%98%9F%E8%A7%86%E9%A2%91%E4%B8%8B%E8%BD%BD/jflocelmhojnkfdiohkoaeepedilngjc)
+[![Edge Add-ons](https://img.shields.io/badge/Edge%20Add--ons-Shooting%20Star%20Downloader-0078D7?style=for-the-badge&logo=microsoftedge)](https://microsoftedge.microsoft.com/addons/detail/%E6%B5%81%E6%98%9F%E8%A7%86%E9%A2%91%E4%B8%8B%E8%BD%BD/jflocelmhojnkfdiohkoaeepedilngjc)
 
 > On first launch, an installation guide will appear automatically, providing two setup files and a terminal command for one-click installation of yt-dlp and FFmpeg.
 
