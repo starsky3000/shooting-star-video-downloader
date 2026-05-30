@@ -1,7 +1,12 @@
 // StarDownload Popup Script
 
+// Must match NATIVE_HOST_VERSION in stardownload.py — bump only when stardownload.py changes
+const EXPECTED_NATIVE_HOST_VERSION = '1.0.2';
+
 let currentVideoInfo = null;
 let currentVideoId = null;
+let currentPlatform = null;
+let currentCookie = ''; // B站登录 Cookie, passed to yt-dlp for HD formats
 let downloadedVideos = [];
 let downloadComplete = false;
 let downloadPaused = false;
@@ -24,6 +29,7 @@ const currentOS = getOS();
 
 // DOM Elements
 const thumbnail = document.getElementById('thumbnail');
+const thumbnailPlaceholder = document.getElementById('thumbnailPlaceholder');
 const videoTitle = document.getElementById('videoTitle');
 const durationBadge = document.getElementById('durationBadge');
 const qualitySelect = document.getElementById('qualitySelect');
@@ -211,22 +217,25 @@ document.addEventListener('DOMContentLoaded', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   log(`Tab URL: ${tab.url}`);
 
-  const isYouTubeWatch = tab.url && tab.url.includes('youtube.com/watch');
-  const isYouTubeShorts = tab.url && tab.url.includes('youtube.com/shorts/');
+  // Detect platform from URL
+  const platform = detectPlatform(tab.url);
+  currentPlatform = platform;
   let currentVideoIdFromUrl = null;
-  if (isYouTubeWatch) {
-    currentVideoIdFromUrl = new URL(tab.url).searchParams.get('v');
-  } else if (isYouTubeShorts) {
-    const match = tab.url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
-    if (match) currentVideoIdFromUrl = match[1];
+  if (platform) {
+    currentVideoIdFromUrl = platform.extractId(tab.url);
   }
-  log(`Current video ID from URL: ${currentVideoIdFromUrl}`);
+  log(`Platform: ${platform ? platform.id : 'none'}, Video ID from URL: ${currentVideoIdFromUrl}`);
+
+  // Read login cookie for platforms that need it (B站 needs SESSDATA for HD)
+  if (platform && platform.id === 'bilibili') {
+    await readBilibiliCookie();
+  }
 
   // === Step 1: Check download state FIRST ===
   const restored = await restoreDownloadState();
   if (restored) {
     log('Restored download state, skipping normal setup');
-    checkNativeHost().then(ok => { if (!ok) log('Native host unavailable after restore'); });
+    checkNativeHost().then(r => { if (!r.ok) log('Native host unavailable after restore'); });
     return;
   }
 
@@ -240,22 +249,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     currentVideo.style.display = 'block';
     showLoadingState(false);
     chrome.runtime.sendMessage({ type: 'videoInfoReceived' }).catch(() => {});
+    const cacheKey = platform ? `${platform.id}:${currentVideoIdFromUrl}` : currentVideoIdFromUrl;
     const keys = Object.keys(formatsByVideoId);
     log(`formatsByVideoId cache has ${keys.length} entries: [${keys.join(', ')}]`);
-    if (formatsByVideoId[currentVideoIdFromUrl]) {
-      log(`Found cached formats for current video ${currentVideoIdFromUrl}`);
-      populateQualitySelect(formatsByVideoId[currentVideoIdFromUrl].formats);
+    if (formatsByVideoId[cacheKey]) {
+      log(`Found cached formats for current video ${cacheKey}`);
+      populateQualitySelect(formatsByVideoId[cacheKey].formats);
     } else {
-      log(`No cached formats for ${currentVideoIdFromUrl}, fetching from native`);
+      log(`No cached formats for ${cacheKey}, fetching from native`);
       formatsAlreadyFetching = true;
-      fetchFormats(currentVideoInfo.url || `https://www.youtube.com/watch?v=${currentVideoIdFromUrl}`, false);
+      fetchFormats(currentVideoInfo.url || (platform ? platform.watchUrl(currentVideoIdFromUrl) : tab.url), false);
     }
     cachedUsed = true;
   }
 
-  // === Step 3: Check native host (only blocks after cache is shown) ===
+  // === Step 3: Check native host and version (only blocks after cache is shown) ===
   const nativeOk = await checkNativeHost();
-  if (!nativeOk) {
+  const versionMismatch = nativeOk.ok && (!nativeOk.version || nativeOk.version !== EXPECTED_NATIVE_HOST_VERSION);
+  log(`Native host version: ${nativeOk.version || 'missing'}, expected: ${EXPECTED_NATIVE_HOST_VERSION}`);
+
+  if (!nativeOk.ok) {
     if (currentVideoInfo) {
       qualitySelect.innerHTML = '';
       addQualityOption('native-unavailable', I18n.t('error_native_unavailable'), true);
@@ -267,157 +280,55 @@ document.addEventListener('DOMContentLoaded', async () => {
     return;
   }
 
-  // === Step 4: If cached info was shown, refresh in background and return ===
+  if (versionMismatch) {
+    log(`Native host outdated (${nativeOk.version} != ${expectedVersion}), showing setup UI`);
+    showSetupUI();
+    return;
+  }
+
+  // === Step 4: If cached info was shown, refresh formats in background and return ===
   if (cachedUsed) {
-    log('Cached info already shown, refreshing formats and meta in background');
+    log('Cached info already shown, refreshing formats in background');
     if (!formatsAlreadyFetching) {
-      fetchFormats(currentVideoInfo.url);
+      // Force re-fetch when we have a cookie (cached formats may be 480p without login)
+      fetchFormats(currentVideoInfo.url, currentCookie ? false : true);
     }
-    refreshVideoMeta(tab.id, currentVideoIdFromUrl);
     log('Setup complete (cached)');
     return;
   }
 
-  // === Step 5: Not YouTube? Show error ===
-  if (!isYouTubeWatch && !isYouTubeShorts) {
-    log('Not a YouTube watch page');
-    showNonVideoError(I18n.t('error_not_youtube'));
+  // === Step 5: Not on a supported video page? Show error ===
+  if (!platform || !currentVideoIdFromUrl) {
+    log('Not on a supported video page');
+    showNonVideoError(I18n.t('error_no_video'));
     return;
   }
 
-  // Get video info directly via scripting
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        const url = location.href;
-        let videoId = null;
-        if (url.includes('/shorts/')) {
-          const m = url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
-          if (m) videoId = m[1];
-        } else {
-          videoId = new URL(url).searchParams.get('v');
-        }
+  // Get video info from yt-dlp (title, duration, thumbnail all come from listFormats response)
+  currentVideoId = currentVideoIdFromUrl;
+  showLoadingState(false);
+  currentVideo.style.display = 'block';
+  qualitySelect.innerHTML = '';
+  addQualityOption('loading', I18n.t('status_loading_formats'), true);
 
-        let title = document.title.replace(/ - YouTube$/, '').trim();
-        title = title.replace(/^\s*\(\d+\)\s*/, '').trim();
+  // Set initial thumbnail (if platform provides one)
+  currentVideoInfo = {
+    url: tab.url,
+    videoId: currentVideoIdFromUrl,
+    title: I18n.t('status_loading_video'),
+    duration: null,
+    thumbnail: platform.thumbnailUrl(currentVideoIdFromUrl) || ''
+  };
 
-        let duration = null;
-
-        try {
-          if (typeof ytInitialPlayerResponse !== 'undefined' && ytInitialPlayerResponse) {
-            if (ytInitialPlayerResponse.videoDetails?.videoId === videoId) {
-              const len = ytInitialPlayerResponse.videoDetails?.lengthSeconds;
-              if (len) duration = parseInt(len) * 1000;
-            }
-          }
-        } catch (e) {}
-
-        if (!duration) {
-          try {
-            const isAd = document.querySelector('.ytp-ad-player-overlay') ||
-                         document.querySelector('.video-ads .ytp-ad-module') ||
-                         document.querySelector('.ad-showing');
-            if (!isAd) {
-              const timeEl = document.querySelector('.ytp-time-duration');
-              if (timeEl && timeEl.textContent) {
-                const parts = timeEl.textContent.trim().split(':').map(Number);
-                if (parts.length === 3) {
-                  duration = (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
-                } else if (parts.length === 2) {
-                  duration = (parts[0] * 60 + parts[1]) * 1000;
-                }
-              }
-            }
-          } catch (e) {}
-        }
-
-        if (!duration) {
-          const meta = document.querySelector('meta[itemprop="duration"]');
-          if (meta) {
-            const iso = meta.getAttribute('content');
-            if (iso) {
-              const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-              if (match) {
-                const hours = parseInt(match[1] || 0);
-                const minutes = parseInt(match[2] || 0);
-                const seconds = parseInt(match[3] || 0);
-                duration = (hours * 3600 + minutes * 60 + seconds) * 1000;
-              }
-            }
-          }
-        }
-
-        return { url, videoId, title, duration };
-      }
-    });
-    const info = results[0].result;
-    log(`Video info: ${JSON.stringify(info)}`);
-
-    if (!info || !info.videoId) {
-      throw new Error('Could not get video info');
-    }
-
-    currentVideoInfo = {
-      url: info.url,
-      videoId: info.videoId,
-      title: info.title,
-      duration: info.duration,
-      thumbnail: `https://i.ytimg.com/vi/${info.videoId}/mqdefault.jpg`
-    };
-    currentVideoId = info.videoId;
-
-    cacheVideoInfo(currentVideoInfo);
-
-    chrome.runtime.sendMessage({ type: 'videoInfoReceived' }).catch(() => {});
-
-    displayVideoInfo(currentVideoInfo);
-
-    showLoadingState(false);
-    currentVideo.style.display = 'block';
-    qualitySelect.innerHTML = '';
-    addQualityOption('loading', I18n.t('status_loading_formats'), true);
-
-    log('Calling fetchFormats (fresh)...');
-    fetchFormats(currentVideoInfo.url, false);
-    log('Setup complete');
-  } catch (err) {
-    log(`Script execution failed: ${err.message}`);
-    try {
-      let videoId = null;
-      const shortsMatch = tab.url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
-      if (shortsMatch) {
-        videoId = shortsMatch[1];
-      } else {
-        videoId = new URL(tab.url).searchParams.get('v');
-      }
-      if (videoId) {
-        currentVideoInfo = {
-          url: tab.url,
-          videoId: videoId,
-          title: I18n.t('video_unknown_title'),
-          duration: null,
-          thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
-        };
-        currentVideoId = videoId;
-        displayVideoInfo(currentVideoInfo);
-        showLoadingState(false);
-        currentVideo.style.display = 'block';
-        qualitySelect.innerHTML = '';
-        addQualityOption('loading', I18n.t('status_loading_formats'), true);
-        fetchFormats(tab.url, false);
-        log('Using fallback video info');
-        return;
-      }
-    } catch (e) {
-      log(`Fallback also failed: ${e.message}`);
-    }
-    showLoadingState(false);
-    showError(I18n.t('error_cannot_get_info'));
-    setDownloadReadyState();
+  if (currentVideoInfo.thumbnail) {
+    thumbnail.src = currentVideoInfo.thumbnail;
   }
+  videoTitle.textContent = currentVideoInfo.title;
+  durationBadge.style.display = 'none';
 
-  log('Event listeners set up');
+  log('Calling fetchFormats to get video info...');
+  fetchFormats(tab.url, false);
+  log('Setup complete');
 });
 
 // Cache video info to storage
@@ -474,6 +385,32 @@ async function loadCachedFormats() {
 
 function showLoadingState(show) {
   loadingState.style.display = show ? 'flex' : 'none';
+}
+
+// Read B站 login cookie (SESSDATA + bili_jct) to pass to yt-dlp for HD formats
+async function readBilibiliCookie() {
+  try {
+    const [sessdata, biliJct] = await Promise.all([
+      chrome.cookies.get({ url: 'https://bilibili.com', name: 'SESSDATA' }),
+      chrome.cookies.get({ url: 'https://bilibili.com', name: 'bili_jct' }),
+    ]);
+    const parts = [];
+    if (sessdata && sessdata.value) {
+      parts.push(`SESSDATA=${sessdata.value}`);
+    }
+    if (biliJct && biliJct.value) {
+      parts.push(`bili_jct=${biliJct.value}`);
+    }
+    currentCookie = parts.join('; ');
+    if (currentCookie) {
+      log(`Bilibili cookie read: SESSDATA=${sessdata ? '***' : 'missing'}, bili_jct=${biliJct ? '***' : 'missing'}`);
+    } else {
+      log('No Bilibili login cookie found');
+    }
+  } catch (e) {
+    log(`Failed to read Bilibili cookie: ${e.message}`);
+    currentCookie = '';
+  }
 }
 
 function formatDuration(seconds) {
@@ -694,9 +631,11 @@ function deleteDownloadedVideo(filePath) {
 function fetchFormats(url, useCached = true) {
   log(`fetchFormats called with URL: ${url}, useCached=${useCached}`);
 
-  if (useCached && currentVideoId && formatsByVideoId[currentVideoId]) {
-    log(`Using per-videoId cached formats for ${currentVideoId}`);
-    populateQualitySelect(formatsByVideoId[currentVideoId].formats);
+  const cacheKey = (currentPlatform && currentVideoId) ? `${currentPlatform.id}:${currentVideoId}` : null;
+
+  if (useCached && cacheKey && formatsByVideoId[cacheKey]) {
+    log(`Using per-videoId cached formats for ${cacheKey}`);
+    populateQualitySelect(formatsByVideoId[cacheKey].formats);
     fetchFormatsFromNative(url);
     return;
   }
@@ -721,8 +660,8 @@ function fetchFormatsFromNative(url) {
     showLoadingState(false);
     currentVideo.style.display = 'block';
     qualitySelect.innerHTML = '';
-    addQualityOption('best', I18n.t('quality_formats_timeout'), true);
-    setDownloadReadyState();
+    addQualityOption('loading', I18n.t('quality_formats_timeout'), true);
+    downloadBtn.style.display = 'none';
   }, 15000);
 
   try {
@@ -736,11 +675,25 @@ function fetchFormatsFromNative(url) {
       if (timedOut) return;
       if (response.type === 'formats') {
         log(`Formats received: ${JSON.stringify(response.formats)}`);
+
+        // Extract video info from yt-dlp response (title, duration, thumbnail)
+        if (response.title && currentVideoInfo) {
+          currentVideoInfo.title = response.title;
+          currentVideoInfo.duration = response.duration ? Math.round(response.duration * 1000) : null;
+          if (response.thumbnail) {
+            currentVideoInfo.thumbnail = response.thumbnail;
+          }
+          displayVideoInfo(currentVideoInfo);
+          cacheVideoInfo(currentVideoInfo);
+        }
+
         cacheFormats(response.formats);
         populateQualitySelect(response.formats);
       } else if (response.type === 'error') {
         log(`Formats error: ${response.message}`);
-        populateQualitySelect([]);
+        showError(response.message);
+        // Hide download button since no formats are available
+        downloadBtn.style.display = 'none';
       }
     });
 
@@ -750,12 +703,19 @@ function fetchFormatsFromNative(url) {
       if (!timedOut) {
         if (cachedFormats) {
           populateQualitySelect(cachedFormats);
+        } else {
+          showError(I18n.t('error_disconnected'));
+          downloadBtn.style.display = 'none';
         }
       }
     });
 
     log('Sending listFormats message...');
-    port.postMessage({ action: 'listFormats', url: url });
+    const msg = { action: 'listFormats', url: url };
+    if (currentCookie) {
+      msg.cookie = currentCookie;
+    }
+    port.postMessage(msg);
     log('Message sent');
   } catch (err) {
     log(`fetchFormats exception: ${err.message}`);
@@ -763,7 +723,8 @@ function fetchFormatsFromNative(url) {
     if (cachedFormats) {
       populateQualitySelect(cachedFormats);
     } else {
-      populateQualitySelect([]);
+      showError(I18n.t('error_native_unavailable'));
+      downloadBtn.style.display = 'none';
     }
   }
 }
@@ -777,8 +738,7 @@ function populateQualitySelect(formats) {
   chrome.runtime.sendMessage({ type: 'formatsReady' }).catch(() => {});
 
   if (!formats || formats.length === 0) {
-    addQualityOption('best', I18n.t('quality_best'), true);
-    setDownloadReadyState();
+    addQualityOption('loading', I18n.t('quality_formats_timeout'), true);
     return;
   }
 
@@ -890,11 +850,12 @@ function populateQualitySelect(formats) {
   }
 
   if (currentVideoId && storageLocal && formats.length > 0) {
+    const cacheKey = currentPlatform ? `${currentPlatform.id}:${currentVideoId}` : currentVideoId;
     storageLocal.get(['formatsCacheByVideoId'], (result) => {
       const cache = result.formatsCacheByVideoId || {};
-      cache[currentVideoId] = { formats, timestamp: Date.now() };
+      cache[cacheKey] = { formats, timestamp: Date.now() };
       storageLocal.set({ formatsCacheByVideoId: cache });
-      log(`Synced formats to formatsCacheByVideoId for ${currentVideoId}`);
+      log(`Synced formats to formatsCacheByVideoId for ${cacheKey}`);
     });
   }
 }
@@ -912,7 +873,15 @@ function log(msg) {
 }
 
 function displayVideoInfo(info) {
-  thumbnail.src = info.thumbnail;
+  if (info.thumbnail) {
+    thumbnail.src = info.thumbnail;
+    thumbnail.style.display = 'block';
+    thumbnailPlaceholder.style.display = 'none';
+  } else {
+    thumbnail.style.display = 'none';
+    thumbnailPlaceholder.style.display = 'flex';
+  }
+
   videoTitle.textContent = info.title;
 
   if (info.duration) {
@@ -920,82 +889,6 @@ function displayVideoInfo(info) {
     durationBadge.style.display = 'block';
   } else {
     durationBadge.style.display = 'none';
-  }
-}
-
-async function refreshVideoMeta(tabId, expectedVideoId) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        let title = document.title.replace(/ - YouTube$/, '').trim();
-        title = title.replace(/^\s*\(\d+\)\s*/, '').trim();
-
-        let duration = null;
-        let videoId = null;
-        if (location.href.includes('/shorts/')) {
-          const m = location.href.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
-          if (m) videoId = m[1];
-        } else {
-          videoId = new URL(location.href).searchParams.get('v');
-        }
-
-        try {
-          if (typeof ytInitialPlayerResponse !== 'undefined' && ytInitialPlayerResponse) {
-            if (ytInitialPlayerResponse.videoDetails?.videoId === videoId) {
-              const len = ytInitialPlayerResponse.videoDetails?.lengthSeconds;
-              if (len) duration = parseInt(len) * 1000;
-            }
-          }
-        } catch (e) {}
-
-        if (!duration) {
-          try {
-            const isAd = document.querySelector('.ytp-ad-player-overlay') ||
-                         document.querySelector('.video-ads .ytp-ad-module') ||
-                         document.querySelector('.ad-showing');
-            if (!isAd) {
-              const timeEl = document.querySelector('.ytp-time-duration');
-              if (timeEl && timeEl.textContent) {
-                const parts = timeEl.textContent.trim().split(':').map(Number);
-                if (parts.length === 3) duration = (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
-                else if (parts.length === 2) duration = (parts[0] * 60 + parts[1]) * 1000;
-              }
-            }
-          } catch (e) {}
-        }
-
-        if (!duration) {
-          const meta = document.querySelector('meta[itemprop="duration"]');
-          if (meta && meta.getAttribute('content')) {
-            const iso = meta.getAttribute('content');
-            const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-            if (match) {
-              duration = ((parseInt(match[1] || 0) * 3600) + (parseInt(match[2] || 0) * 60) + parseInt(match[3] || 0)) * 1000;
-            }
-          }
-        }
-        return { title, duration };
-      }
-    });
-    const meta = results[0].result;
-    if (!meta) return;
-    log(`Refreshed meta: title="${meta.title}", duration=${meta.duration}`);
-
-    if (currentVideoId === expectedVideoId) {
-      if (meta.title && meta.title !== currentVideoInfo.title) {
-        currentVideoInfo.title = meta.title;
-        videoTitle.textContent = meta.title;
-      }
-      if (meta.duration && meta.duration !== currentVideoInfo.duration) {
-        currentVideoInfo.duration = meta.duration;
-        durationBadge.textContent = formatDuration(Math.floor(meta.duration / 1000));
-        durationBadge.style.display = 'block';
-      }
-      cacheVideoInfo(currentVideoInfo);
-    }
-  } catch (err) {
-    log(`refreshVideoMeta failed: ${err.message}`);
   }
 }
 
@@ -1035,7 +928,9 @@ function startDownload() {
     title: currentVideoInfo.title,
     quality: quality,
     videoId: currentVideoId,
-    qualityMeta: qualityMeta
+    qualityMeta: qualityMeta,
+    platformId: currentPlatform ? currentPlatform.id : null,
+    cookie: currentCookie || null
   }).catch(() => {});
 
   setDownloadingState();
@@ -1055,7 +950,8 @@ function togglePauseDownload() {
       quality: qualitySelect.value,
       videoId: currentVideoId,
       qualityMeta: lastDownloadRequest?.qualityMeta || null,
-      isResume: true
+      isResume: true,
+      cookie: currentCookie || null
     }).catch(() => {});
     watchDownloadState();
   } else {
@@ -1185,13 +1081,18 @@ async function restoreDownloadState() {
       if (cachedVideoInfo && state.videoId && cachedVideoInfo.videoId === state.videoId) {
         currentVideoInfo = cachedVideoInfo;
         currentVideoId = cachedVideoInfo.videoId;
+        currentPlatform = detectPlatform(cachedVideoInfo.url || '');
       } else {
         currentVideoId = state.videoId;
+        // Try to detect platform from stored URL or fall back
+        const url = state.url || '';
+        const platform = detectPlatform(url) || currentPlatform;
+        const thumb = platform && platform.thumbnailUrl(state.videoId);
         currentVideoInfo = {
           videoId: state.videoId,
           title: state.videoTitle || I18n.t('video_unknown_title'),
-          url: state.videoId ? `https://www.youtube.com/watch?v=${state.videoId}` : '',
-          thumbnail: state.videoId ? `https://i.ytimg.com/vi/${state.videoId}/mqdefault.jpg` : ''
+          url: url || (platform ? platform.watchUrl(state.videoId) : ''),
+          thumbnail: thumb || ''
         };
       }
 
@@ -1233,9 +1134,15 @@ async function restoreDownloadState() {
           displayVideoInfo(currentVideoInfo);
           downloadComplete = true;
           showDownloadCompleted();
-          if (formatsByVideoId[currentVideoId] && formatsByVideoId[currentVideoId].formats) {
-            log(`Complete case: loading formats from cache for ${currentVideoId}`);
-            populateQualitySelect(formatsByVideoId[currentVideoId].formats);
+          const cacheKey = currentPlatform ? `${currentPlatform.id}:${currentVideoId}` : currentVideoId;
+          // When we have a login cookie, always re-fetch to get HD formats
+          // (cached formats may be low-res from background prefetch without cookie)
+          if (currentCookie && currentVideoInfo.url) {
+            log('Complete case: cookie present, fetching fresh formats from native');
+            fetchFormats(currentVideoInfo.url, false);
+          } else if (formatsByVideoId[cacheKey] && formatsByVideoId[cacheKey].formats) {
+            log(`Complete case: loading formats from cache for ${cacheKey}`);
+            populateQualitySelect(formatsByVideoId[cacheKey].formats);
           } else if (currentVideoInfo.url) {
             log('Complete case: fetching formats from native');
             fetchFormats(currentVideoInfo.url);
@@ -1417,7 +1324,7 @@ function checkNativeHost() {
       if (!resolved) {
         resolved = true;
         log('checkNativeHost: timeout');
-        resolve(false);
+        resolve({ ok: false });
       }
     }, 5000);
 
@@ -1426,7 +1333,7 @@ function checkNativeHost() {
       if (chrome.runtime.lastError) {
         log(`checkNativeHost: connectNative error: ${chrome.runtime.lastError.message}`);
         clearTimeout(timeout);
-        resolve(false);
+        resolve({ ok: false });
         return;
       }
 
@@ -1434,9 +1341,9 @@ function checkNativeHost() {
         if (msg.type === 'pong' && !resolved) {
           resolved = true;
           clearTimeout(timeout);
-          log('checkNativeHost: received pong');
+          log(`checkNativeHost: received pong, version=${msg.version || 'missing'}`);
           port.disconnect();
-          resolve(true);
+          resolve({ ok: true, version: msg.version || '' });
         }
       });
 
@@ -1445,7 +1352,7 @@ function checkNativeHost() {
           resolved = true;
           clearTimeout(timeout);
           log('checkNativeHost: disconnected without pong');
-          resolve(false);
+          resolve({ ok: false });
         }
       });
 
@@ -1455,10 +1362,18 @@ function checkNativeHost() {
         resolved = true;
         clearTimeout(timeout);
         log(`checkNativeHost: exception: ${e.message}`);
-        resolve(false);
+        resolve({ ok: false });
       }
     }
   });
+}
+
+function detectCurrentBrowser() {
+  const ua = navigator.userAgent;
+  if (ua.includes('Edg/')) return 'edge';
+  if (ua.includes('Brave')) return 'brave';
+  if (ua.includes('Chrome/')) return 'chrome';
+  return 'chrome';
 }
 
 function showSetupUI() {
@@ -1498,7 +1413,7 @@ function updateSetupUI() {
     : I18n.t('btn_install_script_mac');
 }
 
-function generateMacInstallScript(extensionId) {
+function generateMacInstallScript(extensionId, browser) {
   const lines = [
     '#!/bin/bash',
     'set -e',
@@ -1506,16 +1421,13 @@ function generateMacInstallScript(extensionId) {
     'echo "=== StarDownload 安装 ==="',
     '',
     '# 1. 检测浏览器并创建 JSON',
-    'echo "1/3 检测浏览器并创建 JSON..."',
+    'echo "1/3 注册 Native Host..."',
     `APP_SUPPORT="\${HOME}/Library/Application Support"`,
-    'FOUND_ANY=false',
-    'for dir in "Google/Chrome" "Chromium" "Microsoft Edge" "360Chrome" "BraveSoftware/Brave-Browser" "Vivaldi"; do',
-    '  if [ -d "$APP_SUPPORT/$dir" ]; then',
-    '    FOUND_ANY=true',
-    '    TARGET_DIR="$APP_SUPPORT/$dir/NativeMessagingHosts"',
-    '    mkdir -p "$TARGET_DIR"',
-    '    echo "  检测到: $dir"',
-    '    cat > "$TARGET_DIR/com.stardownload.host.json" << JSONEOF',
+    `BROWSER_DIR="${browser === 'edge' ? 'Microsoft Edge' : browser === 'brave' ? 'BraveSoftware/Brave-Browser' : 'Google/Chrome'}"`,
+    `TARGET_DIR="$APP_SUPPORT/$BROWSER_DIR/NativeMessagingHosts"`,
+    'mkdir -p "$TARGET_DIR"',
+    `echo "  浏览器: $BROWSER_DIR"`,
+    'cat > "$TARGET_DIR/com.stardownload.host.json" << JSONEOF',
     '{',
     '  "name": "com.stardownload.host",',
     '  "description": "StarDownload Native Messaging Host",',
@@ -1524,22 +1436,6 @@ function generateMacInstallScript(extensionId) {
     `  "allowed_origins": ["chrome-extension://${extensionId}/"]`,
     '}',
     'JSONEOF',
-    '  fi',
-    'done',
-    'if [ "$FOUND_ANY" = false ]; then',
-    '  echo "  未检测到支持的浏览器，写入默认 Chrome 路径"',
-    `  TARGET_DIR="\${HOME}/Library/Application Support/Google/Chrome/NativeMessagingHosts"`,
-    '  mkdir -p "$TARGET_DIR"',
-    '  cat > "$TARGET_DIR/com.stardownload.host.json" << JSONEOF',
-    '{',
-    '  "name": "com.stardownload.host",',
-    '  "description": "StarDownload Native Messaging Host",',
-    `  "path": "\${HOME}/.local/bin/stardownload",`,
-    '  "type": "stdio",',
-    `  "allowed_origins": ["chrome-extension://${extensionId}/"]`,
-    '}',
-    'JSONEOF',
-    'fi',
     '',
     '# 2. 部署 Native Host',
     'echo "2/3 部署脚本..."',
@@ -1575,16 +1471,58 @@ function generateMacInstallScript(extensionId) {
     '  echo "  ffmpeg 已安装"',
     'else',
     '  echo "  安装 ffmpeg..."',
-    '  brew install ffmpeg',
+    '  FF_INSTALLED=0',
+    '  if which brew >/dev/null 2>&1; then',
+    '    if brew install ffmpeg 2>/dev/null; then',
+    '      echo "  ffmpeg 通过 brew 安装成功"',
+    '      FF_INSTALLED=1',
+    '    fi',
+    '  fi',
+    '  if [ "$FF_INSTALLED" -eq 0 ]; then',
+    '    echo "  从 evermeet.cx 下载 ffmpeg..."',
+    '    TMP_ZIP="/tmp/ffmpeg.zip"',
+    '    if curl -L -o "$TMP_ZIP" "https://evermeet.cx/ffmpeg/get/ffmpeg.zip" 2>/dev/null; then',
+    '      if which unzip >/dev/null 2>&1; then',
+    '        unzip -o "$TMP_ZIP" -d /tmp/ffmpeg_extracted >/dev/null 2>&1',
+    '        if [ -f /tmp/ffmpeg_extracted/ffmpeg ]; then',
+    '          chmod +x /tmp/ffmpeg_extracted/ffmpeg',
+    '          mkdir -p ~/.local/bin',
+    '          cp /tmp/ffmpeg_extracted/ffmpeg ~/.local/bin/ffmpeg',
+    '          echo "  ffmpeg 已安装到 ~/.local/bin/ffmpeg"',
+    '          # Add ~/.local/bin to PATH',
+    '          if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then',
+    '            if [ -f ~/.zshrc ]; then',
+    '              echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc',
+    '            fi',
+    '            if [ -f ~/.bashrc ]; then',
+    '              echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc',
+    '            fi',
+    '            export PATH="$HOME/.local/bin:$PATH"',
+    '          fi',
+    '          FF_INSTALLED=1',
+    '        fi',
+    '        rm -rf /tmp/ffmpeg_extracted',
+    '      fi',
+    '      rm -f "$TMP_ZIP"',
+    '    fi',
+    '    if [ "$FF_INSTALLED" -eq 0 ]; then',
+    '      echo "  ⚠ ffmpeg 安装失败，请手动安装: https://ffmpeg.org/download.html"',
+    '    fi',
+    '  fi',
     'fi',
     '',
     'echo ""',
+    '# Clean up downloaded files',
+    `echo "清理下载文件..."`,
+    `rm -f "$PY_FILE"`,
+    `rm -f "\${HOME}/Downloads/install.sh"`,
+    '',
     'echo "✓ 安装完成！请退出浏览器后重新打开。"',
   ];
   return lines.join('\n');
 }
 
-function generateWindowsInstallScript(extensionId) {
+function generateWindowsInstallScript(extensionId, browser) {
   const lines = [
     '# StarDownload Windows Install Script',
     '# Run from PowerShell: powershell -ExecutionPolicy Bypass -File install.ps1',
@@ -1614,14 +1552,43 @@ function generateWindowsInstallScript(extensionId) {
     '',
     '# --------------- step 2: copy stardownload.py ---------------',
     'Write-Host "2/4 Deploying native host..."',
-    '# Look for stardownload.py alongside this script first, then in Downloads',
+    '# Search for stardownload.py in multiple common locations',
+    '# (Edge installed on D: drive often downloads to D: instead of C:',
     '$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path',
-    '$pyFile = "$scriptDir\\native\\stardownload.py"',
-    'if (-not (Test-Path $pyFile)) {',
-    '    $pyFile = "$env:USERPROFILE\\Downloads\\stardownload.py"',
+    '$searchPaths = @(',
+    '    "$scriptDir\\stardownload.py",',
+    '    "$scriptDir\\native\\stardownload.py",',
+    '    "$env:USERPROFILE\\Downloads\\stardownload.py"',
+    ')',
+    '# Also read Edge download path from Registry if available',
+    'try {',
+    '    $edgeDownDir = Get-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Edge\\" -Name "DefaultDownloadDirectory" -ErrorAction SilentlyContinue',
+    '    if ($edgeDownDir -and $edgeDownDir.DefaultDownloadDirectory) {',
+    '        $searchPaths += $edgeDownDir.DefaultDownloadDirectory + "\\stardownload.py"',
+    '        Write-Host "  Found Edge download dir: $($edgeDownDir.DefaultDownloadDirectory)"',
+    '    }',
+    '} catch {}',
+    'try {',
+    '    $edgePrefs = "$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data\\Default\\Preferences"',
+    '    if (Test-Path $edgePrefs) {',
+    '        $prefs = Get-Content $edgePrefs -Raw | ConvertFrom-Json',
+    '        if ($prefs.download.default_directory) {',
+    '            $searchPaths += $prefs.download.default_directory + "\\stardownload.py"',
+    '            Write-Host "  Found Edge download dir from preferences: $($prefs.download.default_directory)"',
+    '        }',
+    '    }',
+    '} catch {}',
+    '# Also try common alternative download roots',
+    '$searchPaths += "D:\\Downloads\\stardownload.py"',
+    '$searchPaths += "E:\\Downloads\\stardownload.py"',
+    '$pyFile = $null',
+    'foreach ($p in $searchPaths) {',
+    '    if ($p -and (Test-Path $p)) { $pyFile = $p; Write-Host "  Found: $pyFile"; break }',
     '}',
-    'if (-not (Test-Path $pyFile)) {',
-    '    Write-Error "Cannot find stardownload.py. Please download it first."',
+    'if (-not $pyFile) {',
+    '    Write-Host "Search paths tried:"',
+    '    $searchPaths | ForEach-Object { if ($_) { Write-Host "  $_" } }',
+    '    Write-Error "Cannot find stardownload.py. Please download it and put it in C:\\Users\\$env:USERNAME\\Downloads"',
     '    exit 1',
     '}',
     'Copy-Item $pyFile "$appDir\\stardownload.py" -Force',
@@ -1644,57 +1611,24 @@ function generateWindowsInstallScript(extensionId) {
     '    allowed_origins = @("chrome-extension://' + extensionId + '/")',
     '} | ConvertTo-Json',
     '',
-    '# Check which browsers are installed',
-    '$browsers = @()',
-    'if (Test-Path "$env:LOCALAPPDATA\\Google\\Chrome") {',
-    '    Write-Host "  Detected: Chrome"',
-    '    $browsers += @{',
-    '        Name = "Chrome"',
-    '        Dir = "$env:LOCALAPPDATA\\Google\\Chrome"',
-    '        RegKey = "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.stardownload.host"',
-    '    }',
-    '}',
-    'if (Test-Path "$env:LOCALAPPDATA\\Microsoft\\Edge") {',
-    '    Write-Host "  Detected: Edge"',
-    '    $browsers += @{',
-    '        Name = "Edge"',
-    '        Dir = "$env:LOCALAPPDATA\\Microsoft\\Edge"',
-    '        RegKey = "HKCU:\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.stardownload.host"',
-    '    }',
-    '}',
-    'if (Test-Path "$env:LOCALAPPDATA\\BraveSoftware\\Brave-Browser") {',
-    '    Write-Host "  Detected: Brave"',
-    '    $browsers += @{',
-    '        Name = "Brave"',
-    '        Dir = "$env:LOCALAPPDATA\\BraveSoftware\\Brave-Browser"',
-    '        RegKey = "HKCU:\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\com.stardownload.host"',
-    '    }',
-    '}',
+    '# Register for the current browser only',
+    `$browserName   = "${browser === 'edge' ? 'Microsoft\\Edge' : browser === 'brave' ? 'BraveSoftware\\Brave-Browser' : 'Google\\Chrome'}"`,
+    `$browserRegKey = "${browser === 'edge' ? 'Microsoft\\Edge' : browser === 'brave' ? 'BraveSoftware\\Brave-Browser' : 'Google\\Chrome'}"`,
+    `$browserAppDir = "$env:LOCALAPPDATA\\$browserName"`,
+    `$regKey        = "HKCU:\\Software\\$browserRegKey\\NativeMessagingHosts\\com.stardownload.host"`,
+    `Write-Host "  Browser: $browserName"`,
     '',
-    'if ($browsers.Count -eq 0) {',
-    '    Write-Host "  No Chromium browser detected. Writing default Chrome config."',
-    '    $browsers += @{',
-    '        Name = "Chrome (default)"',
-    '        Dir = "$env:LOCALAPPDATA\\Google\\Chrome"',
-    '        RegKey = "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.stardownload.host"',
-    '    }',
-    '}',
-    '',
-    'foreach ($browser in $browsers) {',
-    '    try {',
-    '        # Write JSON manifest file to browser dir',
-    '        $targetDir = "$($browser.Dir)\\NativeMessagingHosts"',
-    '        New-Item -ItemType Directory -Force -Path $targetDir | Out-Null',
-    '        Set-Content -Path "$targetDir\\com.stardownload.host.json" -Value $manifestJson -Encoding UTF8',
-    '        # Create registry key recursively',
-    '        $parentKey = Split-Path $browser.RegKey -Parent',
-    '        New-RegistryKey $parentKey',
-    '        New-Item -Path $browser.RegKey -Force | Out-Null',
-    '        Set-ItemProperty -Path $browser.RegKey -Name "(default)" -Value "$targetDir\\com.stardownload.host.json"',
-    '        Write-Host "  $($browser.Name): registered"',
-    '    } catch {',
-    '        Write-Warning "  $($browser.Name): registration failed - $_"',
-    '    }',
+    'try {',
+    '    $targetDir = "$browserAppDir\\NativeMessagingHosts"',
+    '    New-Item -ItemType Directory -Force -Path $targetDir | Out-Null',
+    '    Set-Content -Path "$targetDir\\com.stardownload.host.json" -Value $manifestJson -Encoding UTF8',
+    '    $parentKey = Split-Path $regKey -Parent',
+    '    New-RegistryKey $parentKey',
+    '    New-Item -Path $regKey -Force | Out-Null',
+    '    Set-ItemProperty -Path $regKey -Name "(default)" -Value "$targetDir\\com.stardownload.host.json"',
+    '    Write-Host "  Registered successfully"',
+    '} catch {',
+    '    Write-Warning "  Registration failed: $_"',
     '}',
     '',
     '# --------------- step 4: install dependencies ---------------',
@@ -1721,20 +1655,55 @@ function generateWindowsInstallScript(extensionId) {
     '}',
     '',
     'Write-Host "  Checking ffmpeg..."',
-    'if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {',
+    '$ffmpegTargetDir = "$env:LOCALAPPDATA\\ffmpeg\\bin"',
+    '$ffmpegTargetExe = "$ffmpegTargetDir\\ffmpeg.exe"',
+    'if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -or (Test-Path $ffmpegTargetExe)) {',
     '    Write-Host "  ffmpeg already installed"',
     '} else {',
+    '    Write-Host "  Installing ffmpeg..."',
+    '    $ffmpegInstalled = $false',
+    '    # Try winget first',
     '    try {',
     '        winget install Gyan.FFmpeg --accept-source-agreements --accept-package-agreements',
-    '        Write-Host "  ffmpeg installed"',
-    '    } catch {',
-    '        Write-Warning "ffmpeg install failed. Install manually: https://ffmpeg.org/download.html"',
+    '        if ($LASTEXITCODE -eq 0) { $ffmpegInstalled = $true; Write-Host "  ffmpeg installed via winget" }',
+    '    } catch {}',
+    '    # Fallback: direct download',
+    '    if (-not $ffmpegInstalled) {',
+    '        Write-Host "  winget failed, downloading ffmpeg directly..."',
+    '        $ffmpegZip = "$env:TEMP\\ffmpeg.zip"',
+    '        try {',
+    '            Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $ffmpegZip -ErrorAction Stop',
+    '            $extractDir = "$env:TEMP\\ffmpeg_extracted"',
+    '            if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }',
+    '            Expand-Archive -Path $ffmpegZip -DestinationPath $extractDir -Force',
+    '            $ffmpegExe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1',
+    '            if ($ffmpegExe) {',
+    '                New-Item -ItemType Directory -Force -Path $ffmpegTargetDir | Out-Null',
+    '                Copy-Item $ffmpegExe.FullName -Destination $ffmpegTargetExe -Force',
+    '                $ffprobeExe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffprobe.exe" | Select-Object -First 1',
+    '                if ($ffprobeExe) { Copy-Item $ffprobeExe.FullName -Destination "$ffmpegTargetDir\\ffprobe.exe" -Force }',
+    '                $env:PATH = "$ffmpegTargetDir;$env:PATH"',
+    '                Write-Host "  ffmpeg installed to $ffmpegTargetDir"',
+    '            } else {',
+    '                Write-Warning "Cannot find ffmpeg.exe in extracted archive"',
+    '            }',
+    '            Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue',
+    '        } catch {',
+    '            Write-Warning "ffmpeg download/extract failed: $_"',
+    '        }',
+    '        Remove-Item $ffmpegZip -ErrorAction SilentlyContinue',
     '    }',
     '}',
     '',
     '# --------------- done ---------------',
     'Write-Host ""',
     'Write-Host "======================================"',
+    '',
+    '# Clean up downloaded files',
+    'Write-Host "Cleaning up downloaded files..."',
+    'if ($pyFile -and (Test-Path $pyFile)) { Remove-Item $pyFile -Force; Write-Host "  Deleted: $pyFile" }',
+    'if ($MyInvocation.MyCommand.Path) { Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue; Write-Host "  Deleted: $($MyInvocation.MyCommand.Path)" }',
+    '',
     'Write-Host "  Installation complete!"',
     'Write-Host "======================================"',
     'Write-Host ""',
@@ -1745,10 +1714,11 @@ function generateWindowsInstallScript(extensionId) {
 }
 
 function generateInstallScript(extensionId) {
+  const browser = detectCurrentBrowser();
   if (currentOS === 'win') {
-    return generateWindowsInstallScript(extensionId);
+    return generateWindowsInstallScript(extensionId, browser);
   }
-  return generateMacInstallScript(extensionId);
+  return generateMacInstallScript(extensionId, browser);
 }
 
 async function downloadStardownloadPy() {

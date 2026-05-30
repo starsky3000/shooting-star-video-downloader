@@ -32,7 +32,7 @@
   "status_updating_ytdlp": "正在更新 yt-dlp...",
   "status_downloading_dots": "下载中...",
 
-  "error_not_youtube": "请在视频播放页打开扩展",
+  "error_no_video": "请在支持的视频播放页打开扩展",
   "error_cannot_get_info": "无法获取视频信息，请刷新页面后重试",
   "error_invalid_info": "视频信息无效",
   "error_download_failed": "下载出错",
@@ -42,7 +42,7 @@
   "error_invalid_path": "文件路径无效",
   "error_cannot_play": "无法打开视频：",
   "error_cannot_open_folder": "无法打开文件夹：",
-  "error_format_unavailable": "视频格式不可用，可能是 YouTube 限制",
+  "error_format_unavailable": "视频格式不可用，可能是平台限制",
   "error_ytdlp_updated": "yt-dlp 已更新，请重试下载",
   "error_ytdlp_update_failed": "yt-dlp 更新失败，请手动更新: pipx install yt-dlp",
   "error_cannot_check_version": "无法检查 yt-dlp 版本",
@@ -53,7 +53,7 @@
   "quality_best": "最高画质",
   "quality_audio_only": "仅音频",
   "quality_audio": "音频",
-  "quality_formats_timeout": "最高画质 (格式获取超时)",
+  "quality_formats_timeout": "正在获取画质信息，请稍等，约10~15秒",
   "quality_unknown": "未知画质",
 
   "download_file_size": "{size}",
@@ -69,7 +69,7 @@
   "setup_copied": "命令已复制",
   "setup_copy_failed": "复制失败",
   "setup_download_hint_mac": "下载到 ~/Downloads",
-  "setup_download_hint_windows": "下载到 %USERPROFILE%\\Downloads",
+  "setup_download_hint_windows": "请确保文件保存在 C:\\Users\\用户名\\Downloads，若浏览器下载到其他磁盘请手动复制过去",
   "setup_downloaded_to": "已下载到",
   "setup_terminal_paste": "中粘贴以下命令并按回车运行：",
 

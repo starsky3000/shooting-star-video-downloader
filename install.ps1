@@ -94,14 +94,55 @@ if ($scriptsDir) {
 }
 
 Write-Host "  Checking ffmpeg..."
-if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+$ffmpegTargetDir = "$env:LOCALAPPDATA\ffmpeg\bin"
+$ffmpegTargetExe = "$ffmpegTargetDir\ffmpeg.exe"
+if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -or (Test-Path $ffmpegTargetExe)) {
+    Write-Host "  ffmpeg already installed"
+} else {
+    Write-Host "  Installing ffmpeg..."
+    $ffmpegInstalled = $false
+    # Try winget first
     try {
         winget install Gyan.FFmpeg --accept-source-agreements --accept-package-agreements
-    } catch {
-        Write-Warning "ffmpeg auto-install failed. Please install manually: https://ffmpeg.org/download.html"
+        if ($LASTEXITCODE -eq 0) {
+            $ffmpegInstalled = $true
+            Write-Host "  ffmpeg installed via winget"
+        }
+    } catch {}
+    # Fallback: direct download
+    if (-not $ffmpegInstalled) {
+        Write-Host "  winget failed, downloading ffmpeg directly..."
+        $ffmpegZip = "$env:TEMP\ffmpeg.zip"
+        try {
+            Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $ffmpegZip -ErrorAction Stop
+            $extractDir = "$env:TEMP\ffmpeg_extracted"
+            if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+            Expand-Archive -Path $ffmpegZip -DestinationPath $extractDir -Force
+            # Find the bin directory recursively
+            $binDir = Get-ChildItem -Path $extractDir -Recurse -Directory -Filter "bin" | Select-Object -First 1
+            if ($binDir) {
+                New-Item -ItemType Directory -Force -Path $ffmpegTargetDir | Out-Null
+                # Search for ffmpeg.exe recursively in case it's in a subdirectory
+                $ffmpegExe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+                if ($ffmpegExe) {
+                    Copy-Item $ffmpegExe.FullName -Destination $ffmpegTargetExe -Force
+                    # Also copy ffprobe.exe if present
+                    $ffprobeExe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+                    if ($ffprobeExe) { Copy-Item $ffprobeExe.FullName -Destination "$ffmpegTargetDir\ffprobe.exe" -Force }
+                    $env:PATH = "$ffmpegTargetDir;$env:PATH"
+                    Write-Host "  ffmpeg installed to $ffmpegTargetDir"
+                } else {
+                    Write-Warning "Cannot find ffmpeg.exe in extracted archive"
+                }
+            } else {
+                Write-Warning "Cannot find bin directory in extracted archive"
+            }
+            Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warning "ffmpeg download/extract failed: $_"
+        }
+        Remove-Item $ffmpegZip -ErrorAction SilentlyContinue
     }
-} else {
-    Write-Host "  ffmpeg already installed"
 }
 
 # --------------- step 3: copy native host ---------------

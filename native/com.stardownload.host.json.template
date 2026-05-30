@@ -1,6 +1,6 @@
 {
   "name": "com.stardownload.host",
-  "description": "StarDownload Native Host for YouTube Downloads",
+  "description": "StarDownload Native Messaging Host",
   "path": "<PATH_TO_STARDOWNLOAD_PY>",
   "type": "stdio",
   "allowed_origins": [

@@ -1,17 +1,19 @@
 {
   "manifest_version": 3,
   "name": "__MSG_name__",
-  "version": "1.0.35",
+  "version": "1.0.36",
   "default_locale": "en",
   "description": "__MSG_description__",
   "permissions": [
     "activeTab",
+    "cookies",
     "nativeMessaging",
     "scripting",
     "storage"
   ],
   "host_permissions": [
-    "*://*.youtube.com/*"
+    "*://*.youtube.com/*",
+    "*://*.bilibili.com/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",
@@ -33,8 +35,8 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://*.youtube.com/*"],
-      "js": ["popup/i18n.js", "content/content.js"],
+      "matches": ["*://*.youtube.com/*", "*://*.bilibili.com/*"],
+      "js": ["platforms/youtube.js", "platforms/bilibili.js", "platforms/index.js", "popup/i18n.js", "content/content.js"],
       "run_at": "document_end"
     }
   ],

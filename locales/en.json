@@ -32,7 +32,7 @@
   "status_updating_ytdlp": "Updating yt-dlp...",
   "status_downloading_dots": "Downloading...",
 
-  "error_not_youtube": "Please open the extension on a video page",
+  "error_no_video": "Please open the extension on a supported video page",
   "error_cannot_get_info": "Cannot get video info, please refresh and try again",
   "error_invalid_info": "Invalid video info",
   "error_download_failed": "Download Error",
@@ -42,7 +42,7 @@
   "error_invalid_path": "Invalid file path",
   "error_cannot_play": "Cannot play video: ",
   "error_cannot_open_folder": "Cannot open folder: ",
-  "error_format_unavailable": "Format unavailable, may be restricted by YouTube",
+  "error_format_unavailable": "Format unavailable, may be restricted by the platform",
   "error_ytdlp_updated": "yt-dlp updated, please retry download",
   "error_ytdlp_update_failed": "yt-dlp update failed, manually: pipx install yt-dlp",
   "error_cannot_check_version": "Cannot check yt-dlp version",
@@ -53,7 +53,7 @@
   "quality_best": "Best Quality",
   "quality_audio_only": "Audio Only",
   "quality_audio": "Audio",
-  "quality_formats_timeout": "Best Quality (Format Fetch Timeout)",
+  "quality_formats_timeout": "Fetching format info, please wait... (~10-15s)",
   "quality_unknown": "Unknown",
 
   "download_file_size": "{size}",
@@ -69,7 +69,7 @@
   "setup_copied": "Command copied",
   "setup_copy_failed": "Copy failed",
   "setup_download_hint_mac": "Download to ~/Downloads",
-  "setup_download_hint_windows": "Download to %USERPROFILE%\\Downloads",
+  "setup_download_hint_windows": "Save to C:\\Users\\YourName\\Downloads. If browser uses another drive, copy files there.",
   "setup_downloaded_to": "downloaded to",
   "setup_terminal_paste": "Then paste the following command in",
 

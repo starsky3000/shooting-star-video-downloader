@@ -11,8 +11,10 @@ import subprocess
 import re
 import struct
 import shutil
+import tempfile
 import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 def get_log_path():
     if sys.platform == "darwin":
@@ -35,6 +37,7 @@ def log(message):
         pass
 
 REQUIRED_VERSION = "2026.03.17"
+NATIVE_HOST_VERSION = "1.0.2"  # Bump only when this file changes
 
 def get_ytdlp_path():
     """Find yt-dlp binary"""
@@ -131,6 +134,7 @@ def get_ffmpeg_path():
         paths = [
             "/opt/homebrew/bin/ffmpeg",
             "/usr/local/bin/ffmpeg",
+            os.path.expanduser("~/.local/bin/ffmpeg"),
             "/usr/bin/ffmpeg",
         ]
     elif sys.platform == "win32":
@@ -253,6 +257,26 @@ def send_message(msg):
         return False
 
 
+def cookie_str_to_netscape(cookie_str, domain):
+    """Convert 'SESSDATA=xxx; bili_jct=xxx' to Netscape cookie file content."""
+    lines = ["# Netscape HTTP Cookie File", ""]
+    for item in cookie_str.split("; "):
+        if "=" in item:
+            name, value = item.split("=", 1)
+            # domain, flag, path, secure, expiry, name, value
+            lines.append(f"{domain}\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+    return "\n".join(lines) + "\n"
+
+
+def _cleanup_cookie_file(cookie_file):
+    """Safely remove a temp cookie file."""
+    if cookie_file:
+        try:
+            os.unlink(cookie_file.name)
+        except OSError:
+            pass
+
+
 def handle_list_formats(request):
     """List available formats for a video using yt-dlp JSON output"""
     url = request.get("url")
@@ -260,10 +284,27 @@ def handle_list_formats(request):
         send_message({"type": "error", "message": "No URL provided"})
         return
 
+    cookie = request.get("cookie")
+
     ytdlp = get_ytdlp_path()
     # Use -j to get JSON output instead of parsing table format
-    cmd = [ytdlp, "--no-playlist", "-j", "--no-download", url]
+    cmd = [ytdlp, "--no-playlist", "-j", "--no-download"]
 
+    cookie_file = None
+    if cookie:
+        netloc = urlparse(url).netloc.split(":")[0]
+        parts = netloc.split(".")
+        domain = "." + ".".join(parts[-2:]) if len(parts) > 2 else "." + netloc
+        cookie_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="stardownload_cookies_"
+        )
+        cookie_file.write(cookie_str_to_netscape(cookie, domain))
+        cookie_file.close()
+        cmd.extend(["--cookies", cookie_file.name])
+
+    cmd.append(url)
+
+    log(f"Cookie provided: {bool(cookie)}")
     log(f"Command to execute: {' '.join(cmd)}")
 
     try:
@@ -273,8 +314,34 @@ def handle_list_formats(request):
             text=True,
             timeout=20
         )
+
+        # Clean up temp cookie file
+        if cookie_file:
+            try:
+                os.unlink(cookie_file.name)
+            except OSError:
+                pass
         output = process.stdout
-        log(f"JSON output length: {len(output)}")
+        stderr_output = process.stderr
+        log(f"JSON output length: {len(output)}, stderr length: {len(stderr_output)}")
+
+        if process.returncode != 0:
+            # yt-dlp returned an error
+            err_msg = stderr_output.strip() or output.strip()
+            # Truncate long error messages
+            if len(err_msg) > 500:
+                err_msg = err_msg[:500] + "..."
+            log(f"yt-dlp error (code {process.returncode}): {err_msg}")
+            send_message({"type": "error", "message": f"yt-dlp 获取失败 (错误码: {process.returncode})\n{err_msg}"})
+            return
+
+        # Parse JSON output
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            log(f"JSON parse error: {e}")
+            send_message({"type": "error", "message": f"解析格式信息失败: {e}"})
+            return
 
         # Parse formats from JSON
         formats = parse_formats_from_json(output)
@@ -282,18 +349,35 @@ def handle_list_formats(request):
 
         send_message({
             "type": "formats",
-            "formats": formats
+            "formats": formats,
+            "title": data.get("title", ""),
+            "duration": data.get("duration") or 0,
+            "thumbnail": data.get("thumbnail", ""),
+            "webpage_url": data.get("webpage_url", ""),
+        })
+    except FileNotFoundError:
+        log(f"yt-dlp not found at path: {ytdlp}")
+        _cleanup_cookie_file(cookie_file)
+        send_message({
+            "type": "error",
+            "message": (
+                "未找到 yt-dlp\n\n"
+                f"搜索路径: {ytdlp}\n\n"
+                "请通过以下方式安装 yt-dlp:\n"
+                "• pip: pip install yt-dlp\n"
+                "• macOS: brew install yt-dlp\n"
+                "• 或下载后放入系统 PATH 目录\n\n"
+                "安装后请重启浏览器。"
+            )
         })
     except subprocess.TimeoutExpired:
         log("Format listing timed out")
-        send_message({"type": "error", "message": "获取格式超时"})
-    except json.JSONDecodeError as e:
-        log(f"JSON parse error: {e}")
-        # Fallback: try table-based parsing
-        send_message({"type": "error", "message": f"解析格式信息失败: {e}"})
+        _cleanup_cookie_file(cookie_file)
+        send_message({"type": "error", "message": "获取格式超时，请检查网络连接后重试"})
     except Exception as e:
-        log(f"handle_list_formats error: {e}")
-        send_message({"type": "error", "message": str(e)})
+        log(f"handle_list_formats error: {type(e).__name__}: {e}")
+        _cleanup_cookie_file(cookie_file)
+        send_message({"type": "error", "message": f"获取失败: {type(e).__name__}: {str(e)[:200]}"})
 
 
 def get_codec_name(codec):
@@ -394,8 +478,9 @@ def handle_download(request):
     proxy = request.get("proxy")  # Optional proxy
     quality_meta = request.get("qualityMeta")  # Optional: {height, ext, filesize}
     is_resume = request.get("isResume", False)  # Whether this is a resume after pause
+    cookie = request.get("cookie")  # Optional: login cookie for HD formats (B站 SESSDATA)
 
-    log(f"handle_download called with url={url}, quality={quality}")
+    log(f"handle_download called with url={url}, quality={quality}, cookie={bool(cookie)}")
 
     if not url:
         send_message({"type": "error", "message": "No URL provided"})
@@ -418,6 +503,20 @@ def handle_download(request):
     # Add proxy if specified
     if proxy:
         cmd.extend(["--proxy", proxy])
+
+    # Add cookie for login-required HD formats (B站)
+    cookie_file = None
+    if cookie:
+        netloc = urlparse(url).netloc.split(":")[0]
+        parts = netloc.split(".")
+        domain = "." + ".".join(parts[-2:]) if len(parts) > 2 else "." + netloc
+        cookie_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="stardownload_cookies_"
+        )
+        cookie_file.write(cookie_str_to_netscape(cookie, domain))
+        cookie_file.close()
+        cmd.extend(["--cookies", cookie_file.name])
+        log(f"Added cookies file (length={len(cookie)})")
 
     # Find ffmpeg first to decide strategy
     ffmpeg, can_merge = get_ffmpeg_path()
@@ -626,10 +725,15 @@ def handle_download(request):
             ytdlp_ver = get_ytdlp_version() or "unknown"
             send_message({"type": "error", "message": f"下载失败，错误码: {return_code} (yt-dlp: {ytdlp_ver})"})
 
+        _cleanup_cookie_file(cookie_file)
+    except FileNotFoundError:
+        _cleanup_cookie_file(cookie_file)
+        send_message({"type": "error", "message": "找不到 yt-dlp，请确保已安装"})
     except (BrokenPipeError, OSError):
         # Chrome disconnected the native messaging port
         # Kill the yt-dlp subprocess if still running
         log("BrokenPipeError: Chrome disconnected, killing yt-dlp subprocess")
+        _cleanup_cookie_file(cookie_file)
         if process and process.poll() is None:
             try:
                 process.kill()
@@ -638,10 +742,9 @@ def handle_download(request):
             except Exception as ke:
                 log(f"Error killing yt-dlp: {ke}")
         # Don't try to send an error message - the pipe is broken
-    except FileNotFoundError:
-        send_message({"type": "error", "message": "找不到 yt-dlp，请确保已安装"})
     except Exception as e:
         log(f"handle_download exception: {e}")
+        _cleanup_cookie_file(cookie_file)
         if process and process.poll() is None:
             try:
                 process.kill()
@@ -812,7 +915,7 @@ def main():
                     handle_open_file(request)
             elif action == "ping":
                 log("Sending pong response")
-                send_message({"type": "pong"})
+                send_message({"type": "pong", "version": NATIVE_HOST_VERSION})
             elif action == "getVersion":
                 # Quick check - just return current version, don't check latest
                 version = get_ytdlp_version()

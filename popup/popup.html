@@ -36,7 +36,10 @@
       <div class="current-video" id="currentVideo" style="display: none;">
         <div class="video-info" id="videoInfo">
           <div class="thumbnail-wrapper">
-            <img id="thumbnail" class="thumbnail" alt="Video thumbnail">
+            <div class="thumbnail-placeholder" id="thumbnailPlaceholder">
+              <div class="thumbnail-spinner"></div>
+            </div>
+            <img id="thumbnail" class="thumbnail" alt="Video thumbnail" style="display: none;">
             <div class="duration-badge" id="durationBadge">--:--</div>
           </div>
           <div class="video-details">
@@ -148,6 +151,9 @@
     </footer>
   </div>
 
+  <script src="../platforms/youtube.js"></script>
+  <script src="../platforms/bilibili.js"></script>
+  <script src="../platforms/index.js"></script>
   <script src="i18n.js"></script>
   <script src="popup.js"></script>
 </body>

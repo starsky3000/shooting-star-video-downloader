@@ -35,8 +35,48 @@ if ! command -v brew &> /dev/null; then
 fi
 
 echo ""
-echo "安装 yt-dlp 和 ffmpeg..."
-brew install yt-dlp ffmpeg
+echo "安装 yt-dlp..."
+brew install yt-dlp
+
+echo ""
+echo "安装 ffmpeg..."
+if command -v ffmpeg &> /dev/null; then
+    echo -e "${GREEN}✓ ffmpeg 已安装${NC}"
+elif command -v brew &> /dev/null; then
+    echo "  尝试通过 brew 安装..."
+    if brew install ffmpeg 2>/dev/null; then
+        echo -e "${GREEN}✓ ffmpeg 通过 brew 安装成功${NC}"
+    else
+        echo -e "${YELLOW}  brew 安装失败，尝试直接下载...${NC}"
+        FFMPEG_INSTALLED=0
+    fi
+else
+    FFMPEG_INSTALLED=0
+fi
+
+# Fallback: direct download if brew failed or not available
+if [ "${FFMPEG_INSTALLED:-1}" -eq 0 ] && ! command -v ffmpeg &> /dev/null; then
+    TMP_ZIP="/tmp/ffmpeg.zip"
+    echo "  从 evermeet.cx 下载 ffmpeg..."
+    if curl -L -o "$TMP_ZIP" "https://evermeet.cx/ffmpeg/get/ffmpeg.zip" 2>/dev/null; then
+        if command -v unzip &> /dev/null; then
+            unzip -o "$TMP_ZIP" -d /tmp/ffmpeg_extracted >/dev/null 2>&1
+            if [ -f /tmp/ffmpeg_extracted/ffmpeg ]; then
+                chmod +x /tmp/ffmpeg_extracted/ffmpeg
+                sudo cp /tmp/ffmpeg_extracted/ffmpeg /usr/local/bin/ffmpeg
+                echo -e "${GREEN}✓ ffmpeg 已安装到 /usr/local/bin/ffmpeg${NC}"
+            else
+                echo -e "${YELLOW}⚠ 解压后未找到 ffmpeg 文件${NC}"
+            fi
+            rm -rf /tmp/ffmpeg_extracted
+        else
+            echo -e "${YELLOW}⚠ 未找到 unzip 命令，无法解压${NC}"
+        fi
+        rm -f "$TMP_ZIP"
+    else
+        echo -e "${YELLOW}⚠ 下载 ffmpeg 失败，请手动安装: https://ffmpeg.org/download.html${NC}"
+    fi
+fi
 
 echo ""
 echo "复制原生主机程序到 /usr/local/bin/..."

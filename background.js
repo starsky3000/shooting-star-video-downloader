@@ -1,7 +1,7 @@
 // StarDownload Background Service Worker
 
-// Import i18n module
-importScripts('popup/i18n.js');
+// Import platform modules and i18n
+importScripts('platforms/youtube.js', 'platforms/bilibili.js', 'platforms/index.js', 'popup/i18n.js');
 
 // Initialize i18n
 I18n.init().then(() => {
@@ -46,22 +46,42 @@ function cancelFormatPrefetch() {
 }
 
 // Start 3-second timer before fetching formats in background
-function scheduleFormatPrefetch(tabId, url, videoId) {
+function scheduleFormatPrefetch(tabId, url, cacheKey, platformId) {
   cancelFormatPrefetch();
-  log(`Scheduling format prefetch for ${videoId} in 3s`);
-  activePrefetchVideoId = videoId;
+  log(`Scheduling format prefetch for ${cacheKey} in 3s`);
+  activePrefetchVideoId = cacheKey;
   formatFetchTimer = setTimeout(() => {
     formatFetchTimer = null;
     // Only fetch if still on the same video
-    if (activePrefetchVideoId === videoId) {
-      doBackgroundFormatFetch(url, videoId);
+    if (activePrefetchVideoId === cacheKey) {
+      doBackgroundFormatFetch(url, cacheKey, platformId);
     }
   }, 3000);
 }
 
 // Actually fetch formats in background via native host
-function doBackgroundFormatFetch(url, videoId) {
-  log(`doBackgroundFormatFetch for video: ${videoId}`);
+async function doBackgroundFormatFetch(url, cacheKey, platformId) {
+  log(`doBackgroundFormatFetch for video: ${cacheKey}`);
+
+  // Read login cookie for B站 to get HD formats
+  let cookie = '';
+  if (platformId === 'bilibili') {
+    try {
+      const [sessdata, biliJct] = await Promise.all([
+        chrome.cookies.get({ url: 'https://bilibili.com', name: 'SESSDATA' }),
+        chrome.cookies.get({ url: 'https://bilibili.com', name: 'bili_jct' }),
+      ]);
+      const parts = [];
+      if (sessdata && sessdata.value) parts.push(`SESSDATA=${sessdata.value}`);
+      if (biliJct && biliJct.value) parts.push(`bili_jct=${biliJct.value}`);
+      cookie = parts.join('; ');
+      if (cookie) log(`Background: Bilibili cookie found (len=${cookie.length})`);
+      else log('Background: No Bilibili cookie');
+    } catch (e) {
+      log(`Background: read cookie failed: ${e.message}`);
+    }
+  }
+
   try {
     const port = chrome.runtime.connectNative('com.stardownload.host');
     let resolved = false;
@@ -70,10 +90,10 @@ function doBackgroundFormatFetch(url, videoId) {
       if (resolved) return;
       if (response.type === 'formats') {
         resolved = true;
-        log(`Background fetched ${response.formats.length} formats for ${videoId}`);
-        cacheFormatsByVideoId(videoId, response.formats);
+        log(`Background fetched ${response.formats.length} formats for ${cacheKey}`);
+        cacheFormatsByVideoId(cacheKey, response.formats);
         // If still watching this video, turn icon green
-        if (activePrefetchVideoId === videoId) {
+        if (activePrefetchVideoId === cacheKey) {
           updateIcon(true, true);
           cancelFormatPrefetch();
         }
@@ -91,13 +111,15 @@ function doBackgroundFormatFetch(url, videoId) {
       }
     });
 
-    port.postMessage({ action: 'listFormats', url });
+    const msg = { action: 'listFormats', url };
+    if (cookie) msg.cookie = cookie;
+    port.postMessage(msg);
   } catch (err) {
     log(`doBackgroundFormatFetch error: ${err.message}`);
   }
 }
 
-// Cache formats by videoId in storage
+// Cache formats by platform-scoped key in storage
 function cacheFormatsByVideoId(videoId, formats) {
   chrome.storage.local.get(['formatsCacheByVideoId'], (result) => {
     const cache = result.formatsCacheByVideoId || {};
@@ -124,9 +146,9 @@ function updateDownloadedVideos(videos) {
   chrome.storage.local.set({ downloadedVideos });
 }
 
-// Update extension icon based on whether we're on a YouTube video page with valid video info
-function updateIcon(isYouTubeVideo, hasVideoInfo) {
-  if (isYouTubeVideo && hasVideoInfo) {
+// Update extension icon based on whether we're on a supported video page
+function updateIcon(isOnVideoPage, hasVideoInfo) {
+  if (isOnVideoPage && hasVideoInfo) {
     chrome.action.setIcon({ path: {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
@@ -147,18 +169,18 @@ function updateIcon(isYouTubeVideo, hasVideoInfo) {
 function initAllTabsGray() {
   updateIcon(false, false);
   chrome.tabs.query({}, (tabs) => {
-    const youtubeTabs = tabs.filter(t => t.url && (t.url.includes('youtube.com/watch') || t.url.includes('youtube.com/shorts/')));
-    youtubeTabs.forEach(tab => {
-      checkYouTubeVideoStatus(tab.id, tab.url);
+    const videoTabs = tabs.filter(t => t.url && isSupported(t.url));
+    videoTabs.forEach(tab => {
+      checkVideoStatus(tab.id, tab.url);
     });
   });
 }
 
-// Listen for tab updates to check YouTube video status
+// Listen for tab updates to check video page status
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   cancelFormatPrefetch();
   if (changeInfo.status === 'complete' && tab.url) {
-    checkYouTubeVideoStatus(tabId, tab.url);
+    checkVideoStatus(tabId, tab.url);
   }
 });
 
@@ -168,7 +190,7 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   chrome.tabs.get(activeInfo.tabId, (tab) => {
     if (tab) {
       if (tab.url) {
-        checkYouTubeVideoStatus(tab.id, tab.url);
+        checkVideoStatus(tab.id, tab.url);
       } else {
         updateIcon(false, false);
       }
@@ -176,42 +198,32 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   });
 });
 
-// Check if URL is a YouTube watch page or shorts with video
-function checkYouTubeVideoStatus(tabId, url) {
-  if (!url || (!url.includes('youtube.com/watch') && !url.includes('youtube.com/shorts/'))) {
+// Check if URL is a supported video page
+function checkVideoStatus(tabId, url) {
+  const platform = detectPlatform(url);
+  if (!platform) {
     updateIcon(false, false);
     cancelFormatPrefetch();
     return;
   }
 
-  // Extract videoId from URL
-  let videoId = null;
-  if (url.includes('youtube.com/shorts/')) {
-    const match = url.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
-    if (match) videoId = match[1];
-  } else {
-    try {
-      videoId = new URL(url).searchParams.get('v');
-    } catch (e) {}
-  }
-
+  const videoId = platform.extractId(url);
   if (!videoId) {
     updateIcon(true, false);
     return;
   }
 
-  // Check if formats are already cached for this video
+  // Platform-scoped cache key (e.g. "bilibili:BV1xx")
+  const cacheKey = `${platform.id}:${videoId}`;
   chrome.storage.local.get(['formatsCacheByVideoId'], (result) => {
     const cache = result.formatsCacheByVideoId || {};
-    if (cache[videoId]) {
-      // Formats already cached, icon green immediately
-      log(`Formats already cached for ${videoId}, icon green`);
+    if (cache[cacheKey]) {
+      log(`Formats already cached for ${cacheKey}, icon green`);
       updateIcon(true, true);
     } else {
-      // Formats not cached, stay gray, schedule prefetch
-      log(`Formats not cached for ${videoId}, icon gray, scheduling prefetch`);
+      log(`Formats not cached for ${cacheKey}, icon gray, scheduling prefetch`);
       updateIcon(true, false);
-      scheduleFormatPrefetch(tabId, url, videoId);
+      scheduleFormatPrefetch(tabId, url, cacheKey, platform.id);
     }
   });
 }
@@ -228,7 +240,8 @@ function doStartDownload(request) {
     title: request.title,
     quality: request.quality,
     qualityMeta: request.qualityMeta,
-    isResume: request.isResume || false
+    isResume: request.isResume || false,
+    cookie: request.cookie || null
   };
 
   if (request.isResume) {
@@ -267,7 +280,9 @@ function doStartDownload(request) {
       videoId: request.videoId || null,
       videoTitle: request.title || null,
       qualityMeta: request.qualityMeta || null,
-      quality: request.quality || null
+      quality: request.quality || null,
+      url: request.url || null,
+      platformId: request.platformId || null
     });
 
   } catch (err) {
@@ -478,7 +493,7 @@ chrome.storage.local.get(['downloadState', 'downloadedVideos'], (result) => {
   }
 });
 
-// Set all icons to gray immediately, then check YouTube tabs
+// Set all icons to gray immediately, then check video tabs
 initAllTabsGray();
 
 // Listen for storage changes: when popup stores formats, update icon immediately
@@ -488,7 +503,7 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     const tab = tabs[0];
     if (tab && tab.url) {
-      checkYouTubeVideoStatus(tab.id, tab.url);
+      checkVideoStatus(tab.id, tab.url);
     }
   });
 });
